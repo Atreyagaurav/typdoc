@@ -5,20 +5,52 @@ use iced::widget::{
 use iced::Element;
 use iced::{Length, Task};
 use indexmap::{map::MutableEntryKey, IndexMap};
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::{fs::File, path::Path};
+use typst_as_lib::{TypstEngine, TypstTemplateMainFile};
+use typst_layout::PagedDocument;
+use zip::read::ZipArchive;
+use zip::write::FileOptions;
+use zip::ZipWriter;
+
+static FONT: &[u8] = include_bytes!("./texgyrecursor-regular.otf");
 
 fn main() {
-    iced::application(State::default, State::update, State::view)
+    iced::application(State::new, State::update, State::view)
         .run()
         .unwrap()
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct State {
+    filepath: Option<PathBuf>,
     project: Project,
+    engine: Option<TypstEngine<TypstTemplateMainFile>>,
+    document: Option<PagedDocument>,
     alternative: Option<String>,
     page: Option<image::Handle>,
     query: Option<Query>,
+}
+
+impl State {
+    fn new() -> Self {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match args.as_slice() {
+            [] => State::default(),
+            [path] => {
+                let project = Project::from_file(path.as_ref()).unwrap();
+                let engine = Some(project.typst_engine());
+                State {
+                    project,
+                    engine,
+                    ..Default::default()
+                }
+            }
+            [..] => panic!("invalid inputs"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -39,28 +71,41 @@ enum Query {
 
 impl Query {
     fn view<'a>(&'a self, alts: &'a [String]) -> Element<'a, Message> {
-        let q: Element<_> = match self {
-            Query::NewAlternative(name, from) => row![
-                text_input("Name", &name).on_input(Message::QueryStringEdit),
-                pick_list(alts, from.as_ref(), Message::QueryDropDownChanged),
-            ]
-            .into(),
-            Query::RenameAlternative(_, name) => row![text_input("Name", &name)
-                .on_input(Message::QueryStringEdit)
-                .on_submit(Message::SubmitQuery)]
-            .into(),
-            Query::EditTemplate(content) => text_editor(&content)
-                .on_action(Message::QueryEditorAction)
-                .highlight("typ", iced_highlighter::Theme::InspiredGitHub)
-                .height(Length::Fill)
+        let (title, q): (&'static str, Element<_>) = match self {
+            Query::NewAlternative(name, from) => (
+                "Add a new Alternative",
+                row![
+                    text_input("Name", &name).on_input(Message::QueryStringEdit),
+                    pick_list(alts, from.as_ref(), Message::QueryDropDownChanged),
+                ]
                 .into(),
-            Query::EditDescription(content) => text_editor(&content)
-                .on_action(Message::QueryEditorAction)
-                .height(Length::Fill)
+            ),
+            Query::RenameAlternative(_, name) => (
+                "Rename Alternative",
+                row![text_input("Name", &name)
+                    .on_input(Message::QueryStringEdit)
+                    .on_submit(Message::SubmitQuery)]
                 .into(),
-            Query::ExportFile(_) => text("todo").into(),
+            ),
+            Query::EditTemplate(content) => (
+                "Edit Typst Template",
+                text_editor(&content)
+                    .on_action(Message::QueryEditorAction)
+                    .highlight("typ", iced_highlighter::Theme::InspiredGitHub)
+                    .height(Length::Fill)
+                    .into(),
+            ),
+            Query::EditDescription(content) => (
+                "Edit Description",
+                text_editor(&content)
+                    .on_action(Message::QueryEditorAction)
+                    .height(Length::Fill)
+                    .into(),
+            ),
+            Query::ExportFile(_) => ("Export File", text("todo").into()),
         };
         column![
+            text(title),
             q,
             row![
                 button("Submit").on_press(Message::SubmitQuery),
@@ -77,6 +122,9 @@ impl Query {
 
 #[derive(Clone)]
 enum Message {
+    OpenProject,
+    SaveProject,
+    RefreshPage,
     SubmitQuery,
     CancelQuery,
     EditTemplate,
@@ -87,9 +135,7 @@ enum Message {
     ProjectDescriptionChange(String),
     MultiLineDescription,
     NewAlternative,
-    NewAlternativeName(String),
-    NewAlternativeFrom(String),
-    NewAlternativeSubmit,
+    AlternativeSelect(String),
     EditVariableName(usize, String),
     EditVariableValue(usize, String),
     NewVariable(String),
@@ -108,6 +154,34 @@ impl State {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::OpenProject => {
+                self.project = Project::from_file("test.typdoc".as_ref()).unwrap();
+            }
+            Message::SaveProject => {
+                self.project.save_file("test.typdoc".as_ref()).unwrap();
+            }
+            Message::RefreshPage => {
+                println!("{}", self.project.template);
+                let eng = self.project.typst_engine();
+                self.document = match eng.compile().output {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        eprintln!("Error compiling: {e:?}");
+                        None
+                    }
+                };
+                if let Some(doc) = &self.document {
+                    let opt = typst_render::RenderOptions::default();
+                    eprintln!("Pages: {}", doc.pages().len());
+                    let pixmap = typst_render::render(&doc.pages()[0], &opt);
+                    pixmap.save_png("test.png").unwrap();
+                    self.page = Some(image::Handle::from_rgba(
+                        pixmap.width(),
+                        pixmap.height(),
+                        pixmap.data().to_vec(),
+                    ));
+                }
+            }
             Message::SubmitQuery => {
                 let q = match self.query.take() {
                     Some(q) => q,
@@ -116,13 +190,16 @@ impl State {
                 };
                 match q {
                     Query::NewAlternative(name, from) => {
-                        self.project.add_alternative(name, from);
+                        self.project.add_alternative(name.clone(), from);
+                        self.alternative = Some(name)
                     }
                     Query::RenameAlternative(ind, name) => {
-                        self.project.rename_alternative(ind, name);
+                        self.project.rename_alternative(ind, name.clone());
+                        self.alternative = Some(name)
                     }
                     Query::EditTemplate(content) => {
-                        self.project.template.content = content.text();
+                        self.project.template = content.text();
+                        self.engine = Some(self.project.typst_engine());
                     }
                     Query::EditDescription(content) => {
                         self.project.metadata.description = content.text();
@@ -166,23 +243,6 @@ impl State {
             Message::NewAlternative => {
                 self.query = Some(Query::NewAlternative(String::new(), None));
             }
-            Message::NewAlternativeName(name) => {
-                if let Some(Query::NewAlternative(q, _f)) = &mut self.query {
-                    *q = name;
-                }
-            }
-            Message::NewAlternativeFrom(from) => {
-                if let Some(Query::NewAlternative(_q, f)) = &mut self.query {
-                    *f = Some(from);
-                }
-            }
-            Message::NewAlternativeSubmit => {
-                if let Some(Query::NewAlternative(q, _f)) = &self.query {
-                    self.project
-                        .alternatives
-                        .insert(q.to_string(), Alternative::new(q.to_string()));
-                }
-            }
             Message::MultiLineDescription => {
                 self.query = Some(Query::EditDescription(text_editor::Content::with_text(
                     &self.project.metadata.description,
@@ -190,8 +250,11 @@ impl State {
             }
             Message::EditTemplate => {
                 self.query = Some(Query::EditTemplate(text_editor::Content::with_text(
-                    &self.project.template.content,
+                    &self.project.template,
                 )));
+            }
+            Message::AlternativeSelect(alt) => {
+                self.alternative = Some(alt);
             }
             Message::EditVariableName(ind, name) => {}
             _ => (),
@@ -210,6 +273,11 @@ impl State {
     fn left_pane<'a>(&'a self) -> Element<'a, Message> {
         column![
             row![
+                button("Open Project").on_press(Message::OpenProject),
+                horizontal(),
+                button("Save Project").on_press(Message::SaveProject),
+            ],
+            row![
                 text("Project Name:").width(Length::FillPortion(1)),
                 text_input("Name", &self.project.metadata.name)
                     .on_input(Message::ProjectNameChange)
@@ -218,16 +286,32 @@ impl State {
             .width(Length::Fill),
             row![
                 text("Description:").width(Length::FillPortion(1)),
-                text_input("Description", &self.project.metadata.description)
-                    .on_input(Message::ProjectDescriptionChange)
-                    .width(Length::FillPortion(3)),
+                text_input(
+                    "Description",
+                    &self
+                        .project
+                        .metadata
+                        .description
+                        .split("\n")
+                        .next()
+                        .unwrap_or("")
+                )
+                .on_input_maybe(
+                    (!self.project.metadata.description.contains("\n"))
+                        .then_some(Message::ProjectDescriptionChange)
+                )
+                .width(Length::FillPortion(3)),
                 button("...").on_press(Message::MultiLineDescription)
             ]
             .width(Length::Fill),
             row![
                 text("Alternative:"),
-                text("Placeholder"),
-                button("Add new").on_press(Message::NewAlternative),
+                pick_list(
+                    self.project.alt_list.as_ref(),
+                    self.alternative.as_ref(),
+                    Message::AlternativeSelect
+                ),
+                button("+").on_press(Message::NewAlternative),
             ]
             .width(Length::Fill),
             button("Edit Template").on_press(Message::EditTemplate),
@@ -241,9 +325,15 @@ impl State {
         if let Some(query) = &self.query {
             query.view(&self.project.alt_list)
         } else {
-            column![row![button("Refresh"), button("Export")], self.page()]
-                .width(Length::FillPortion(1))
-                .into()
+            column![
+                row![
+                    button("Refresh").on_press(Message::RefreshPage),
+                    button("Export")
+                ],
+                self.page()
+            ]
+            .width(Length::FillPortion(1))
+            .into()
         }
     }
 
@@ -256,10 +346,12 @@ impl State {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Project {
     metadata: Metadata,
-    template: Template,
+    #[serde(skip)]
+    template: String,
+    template_info: TemplateInfo,
     variables: IndexMap<String, String>,
     resources: IndexMap<String, Resource>,
     alternatives: IndexMap<String, Alternative>,
@@ -302,36 +394,97 @@ impl Project {
             }
         }
     }
+
+    fn save_file(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::create(path)?;
+        let mut zip = ZipWriter::new(file);
+
+        zip.start_file("config.json", FileOptions::<()>::default())?;
+        let json_config = serde_json::to_string(&self)?;
+        zip.write_all(json_config.as_bytes())?;
+
+        zip.start_file("template.typ", FileOptions::<()>::default())?;
+        zip.write_all(self.template.as_bytes())?;
+
+        for (name, res) in &self.resources {
+            zip.start_file(name, FileOptions::<()>::default())?;
+            zip.write_all(&res.contents)?;
+        }
+
+        zip.finish()?;
+        Ok(())
+    }
+
+    fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = File::open(path)?;
+        let mut archive = ZipArchive::new(file)?;
+
+        let mut project: Project = {
+            let mut file = archive.by_name("config.json")?;
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)?;
+            let contents = String::from_utf8(buffer)?;
+            serde_json::from_str(&contents)?
+        };
+        project.template = {
+            let mut file = archive.by_name("template.typ")?;
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)?;
+            String::from_utf8(buffer)?
+        };
+
+        for (name, res) in &mut project.resources {
+            let mut file = archive.by_name(name)?;
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)?;
+            res.contents = buffer.clone();
+        }
+
+        Ok(project)
+    }
+
+    fn typst_engine(&self) -> TypstEngine<TypstTemplateMainFile> {
+        let res: Vec<(&str, &[u8])> = self
+            .resources
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.contents.as_slice()))
+            .collect();
+        TypstEngine::builder()
+            .with_static_file_resolver(res)
+            .main_file(self.template.clone())
+            .fonts([FONT])
+            .build()
+    }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Resource {
     path: PathBuf,
+    #[serde(skip)]
     contents: Vec<u8>,
     last_modfied: DateTime<Utc>,
 }
 
-#[derive(Default, Clone)]
-struct Template {
-    /// Actual typst content
-    content: String,
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct TemplateInfo {
+    typst_version: String,
     /// When was the content last modified
     last_modified: DateTime<Utc>,
     /// The user that last modified the template
     modified_by: String,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Metadata {
     name: String,
     description: String,
     last_modified: DateTime<Utc>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Alternative {
     name: String,
-    variables: IndexMap<String, String>,
+    variables: IndexMap<String, Variable>,
 }
 
 impl Alternative {
@@ -343,7 +496,7 @@ impl Alternative {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Variable {
     name: String,
     value: String,

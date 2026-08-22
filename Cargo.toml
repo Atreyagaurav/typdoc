@@ -4,9 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-chrono = "0.4.45"
-iced = { version = "0.14.0", features = ["highlighter", "image", "svg"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+iced = { version = "0.14.0", features = ["advanced", "highlighter", "image", "svg"] }
 iced_highlighter = "0.14.0"
 indexmap = { version = "2.14.0", features = ["serde"] }
-serde = { version = "1.0.229", features = ["serde_derive"] }
+serde = { version = "1.0.229", features = ["derive", "serde_derive"] }
 serde_json = "1.0.151"
+typst-as-lib = "0.16.0"
+typst-layout = "0.15.1"
+typst-render = "0.15.1"
+zip = "8.6.0"
