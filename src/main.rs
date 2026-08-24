@@ -1,11 +1,11 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use iced::Element;
 use iced::widget::{
     button, column, container, image, mouse_area,
     operation::focus,
     pick_list, row, scrollable,
     space::{horizontal, vertical},
-    text, text_input,
+    text, text_input, tooltip,
 };
 use iced::{Color, Length, Task};
 use indexmap::{IndexMap, map::MutableEntryKey};
@@ -20,6 +20,12 @@ use typst_layout::PagedDocument;
 use zip::ZipWriter;
 use zip::read::ZipArchive;
 use zip::write::FileOptions;
+
+macro_rules! current_user {
+    () => {
+        whoami::realname().ok().or_else(|| whoami::username().ok())
+    };
+}
 
 static FONT: &[u8] = include_bytes!("./DejaVuSans.ttf");
 
@@ -182,8 +188,11 @@ impl State {
                 let val = val.trim();
                 if alt.variables.replace_index(ind, val.to_string()).is_ok() {
                     let v = &mut alt.variables[val];
-                    v.name = val.to_string();
-                    v.last_modified = Utc::now();
+                    if v.name != val {
+                        v.name = val.to_string();
+                        v.last_modified = Utc::now();
+                        v.modified_by = current_user!();
+                    }
                     true
                 } else {
                     self.edit_variable = Some((ind, true, val.to_string()));
@@ -192,8 +201,11 @@ impl State {
             }
             Some((ind, false, val)) => {
                 if let Some((_, v)) = alt.variables.get_index_mut(ind) {
-                    v.value = val;
-                    v.last_modified = Utc::now();
+                    if v.value != val {
+                        v.value = val;
+                        v.last_modified = Utc::now();
+                        v.modified_by = current_user!();
+                    }
                     true
                 } else {
                     true
@@ -435,19 +447,28 @@ impl State {
             .resources
             .iter()
             .enumerate()
-            .map(|(i, (k, _))| {
+            .map(|(i, (k, v))| {
                 row![
                     mouse_area(
                         container(text(k))
                             .padding(5)
                             .style(container::bordered_box)
-                            .width(Length::FillPortion(1))
+                            .width(Length::FillPortion(2))
                     )
                     .on_press(Message::RenameResource(i)),
+                    tooltip(
+                        container(text(v.relative_time()))
+                            .padding(5)
+                            .style(container::bordered_box)
+                            .width(Length::FillPortion(1)),
+                        container(text(v.modified_by())).style(container::rounded_box),
+                        tooltip::Position::Top,
+                    ),
                     horizontal().width(25),
-                    button("Download").on_press(Message::DownloadResource(i)),
-                    button("Delete").on_press(Message::DeleteResource(i)),
+                    button("v").on_press(Message::DownloadResource(i)),
+                    button("x").on_press(Message::DeleteResource(i)),
                 ]
+                .spacing(10)
                 .into()
             })
             .collect();
@@ -638,6 +659,7 @@ impl Project {
                 path: filename,
                 contents: data,
                 last_modified: Utc::now(),
+                uploaded_by: current_user!(),
             },
         );
     }
@@ -711,6 +733,32 @@ struct Resource {
     #[serde(skip)]
     contents: Vec<u8>,
     last_modified: DateTime<Utc>,
+    uploaded_by: Option<String>,
+}
+
+impl Resource {
+    fn relative_time(&self) -> String {
+        let duration = Utc::now().signed_duration_since(&self.last_modified);
+        if duration.num_seconds() < 60 {
+            "<1 m".to_string()
+        } else if duration.num_minutes() < 60 {
+            format!("{} m", duration.num_minutes())
+        } else if duration.num_hours() < 24 {
+            format!("{} h", duration.num_hours())
+        } else {
+            format!("{} d", duration.num_days())
+        }
+    }
+
+    fn modified_by(&self) -> String {
+        format!(
+            "By {} at {}",
+            self.uploaded_by.as_deref().unwrap_or("<unknown>"),
+            self.last_modified
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+        )
+    }
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -759,7 +807,6 @@ impl Alternative {
                                     .on_input(Message::EditVariableField)
                                     .on_submit(Message::SubmitVariableEdit)
                                     .width(Length::FillPortion(1)),
-                                horizontal().width(25),
                                 mouse_area(
                                     container(text(&v.value))
                                         .padding(5)
@@ -767,7 +814,16 @@ impl Alternative {
                                         .width(Length::FillPortion(3))
                                 )
                                 .on_press(Message::StartEdit(i, false)),
+                                tooltip(
+                                    container(text(v.relative_time()))
+                                        .padding(5)
+                                        .style(container::bordered_box)
+                                        .width(Length::FillPortion(1)),
+                                    container(text(v.modified_by())).style(container::rounded_box),
+                                    tooltip::Position::Top,
+                                ),
                             ]
+                            .spacing(10)
                         } else {
                             row![
                                 mouse_area(
@@ -777,13 +833,21 @@ impl Alternative {
                                         .width(Length::FillPortion(1))
                                 )
                                 .on_press(Message::StartEdit(i, true)),
-                                horizontal().width(25),
                                 text_input("Value", val)
                                     .id("currentEdit")
                                     .on_input(Message::EditVariableField)
                                     .on_submit(Message::SubmitVariableEdit)
-                                    .width(Length::FillPortion(3))
+                                    .width(Length::FillPortion(3)),
+                                tooltip(
+                                    container(text(v.relative_time()))
+                                        .padding(5)
+                                        .style(container::bordered_box)
+                                        .width(Length::FillPortion(1)),
+                                    container(text(v.modified_by())).style(container::rounded_box),
+                                    tooltip::Position::Top,
+                                ),
                             ]
+                            .spacing(10)
                         }
                     } else {
                         row![
@@ -794,7 +858,6 @@ impl Alternative {
                                     .width(Length::FillPortion(1))
                             )
                             .on_press(Message::StartEdit(i, true)),
-                            horizontal().width(25),
                             mouse_area(
                                 container(text(&v.value))
                                     .padding(5)
@@ -802,7 +865,16 @@ impl Alternative {
                                     .width(Length::FillPortion(3))
                             )
                             .on_press(Message::StartEdit(i, false)),
+                            tooltip(
+                                container(text(v.relative_time()))
+                                    .padding(5)
+                                    .style(container::bordered_box)
+                                    .width(Length::FillPortion(1)),
+                                container(text(v.modified_by())).style(container::rounded_box),
+                                tooltip::Position::Top,
+                            ),
                         ]
+                        .spacing(10)
                     }
                     .into()
                 })
@@ -820,7 +892,6 @@ impl Alternative {
                                 .width(Length::FillPortion(1))
                         )
                         .on_press(Message::StartEdit(i, true)),
-                        horizontal().width(25),
                         mouse_area(
                             container(text(&v.value))
                                 .padding(5)
@@ -828,7 +899,16 @@ impl Alternative {
                                 .width(Length::FillPortion(3))
                         )
                         .on_press(Message::StartEdit(i, false)),
+                        tooltip(
+                            container(text(v.relative_time()))
+                                .padding(5)
+                                .style(container::bordered_box)
+                                .width(Length::FillPortion(1)),
+                            container(text(v.modified_by())).style(container::rounded_box),
+                            tooltip::Position::Top,
+                        ),
                     ]
+                    .spacing(10)
                     .into()
                 })
                 .collect()
@@ -842,12 +922,16 @@ impl Alternative {
                         .width(Length::FillPortion(1))
                 )
                 .on_press(Message::NewVariable),
-                horizontal().width(25),
                 container(text("..Value..").color(Color::WHITE.scale_alpha(0.4)))
                     .padding(5)
                     .style(container::bordered_box)
-                    .width(Length::FillPortion(3))
+                    .width(Length::FillPortion(3)),
+                container(text("..Updated..").color(Color::WHITE.scale_alpha(0.4)))
+                    .padding(5)
+                    .style(container::bordered_box)
+                    .width(Length::FillPortion(1)),
             ]
+            .spacing(10)
             .into(),
         );
         iced::widget::Column::from_vec(vars)
@@ -871,7 +955,7 @@ struct Variable {
     name: String,
     value: String,
     last_modified: DateTime<Utc>,
-    modified_by: String,
+    modified_by: Option<String>,
 }
 
 impl Default for Variable {
@@ -880,8 +964,33 @@ impl Default for Variable {
             name: String::new(),
             value: String::new(),
             last_modified: Utc::now(),
-            modified_by: String::new(),
+            modified_by: current_user!(),
         }
+    }
+}
+
+impl Variable {
+    fn relative_time(&self) -> String {
+        let duration = Utc::now().signed_duration_since(&self.last_modified);
+        if duration.num_seconds() < 60 {
+            "<1 m".to_string()
+        } else if duration.num_minutes() < 60 {
+            format!("{} m", duration.num_minutes())
+        } else if duration.num_hours() < 24 {
+            format!("{} h", duration.num_hours())
+        } else {
+            format!("{} d", duration.num_days())
+        }
+    }
+
+    fn modified_by(&self) -> String {
+        format!(
+            "By {} at {}",
+            self.modified_by.as_deref().unwrap_or("<unknown>"),
+            self.last_modified
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+        )
     }
 }
 
