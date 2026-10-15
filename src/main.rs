@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local, Utc};
 use iced::Element;
 use iced::widget::{
-    button, column, container, image, mouse_area,
+    button, checkbox, column, container, image, mouse_area,
     operation::focus,
     pick_list, row, scrollable,
     space::{horizontal, vertical},
@@ -65,13 +65,135 @@ impl State {
             [..] => panic!("invalid inputs"),
         }
     }
+
+    fn variables(&self) -> &IndexMap<String, Variable> {
+        let alt = if let Some(alt) = &self.alternative {
+            &self.project.alternatives[alt]
+        } else {
+            &self.project.variables
+        };
+        &alt.variables
+    }
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct ExportOptions {
-    format: String,
-    document: String,
+    format: ExportFormat,
+    // document: String,
     filename: String,
+    pages: String,
+    export_all: bool,
+}
+
+enum TemplatePart<'a> {
+    Var(&'a str),
+    Lit(&'a str),
+    Page(&'a str, usize),
+}
+
+/// Template for the names, variables inside {}, page numbers are variables that end in one or more #
+/// multiple # are zero padded
+fn parse_templ(name: &str) -> Vec<TemplatePart<'_>> {
+    let mut parts = vec![];
+    let mut pointer = 0usize;
+    let mut variable = false;
+    for (i, c) in name.char_indices() {
+        match c {
+            '{' if !variable => {
+                variable = true;
+                if pointer != i {
+                    parts.push(TemplatePart::Lit(&name[pointer..i]));
+                }
+                pointer = i + 1;
+            }
+            '}' if variable => {
+                variable = false;
+                if pointer != i {
+                    let var = &name[pointer..i];
+                    if var.chars().rev().next() == Some('#') {
+                        let pre = var.trim_end_matches('#');
+                        parts.push(TemplatePart::Page(
+                            &name[pointer..(pointer + pre.len())],
+                            var.len() - pre.len(),
+                        ));
+                    } else {
+                        parts.push(TemplatePart::Var(var));
+                    }
+                }
+                pointer = i + 1;
+            }
+            _ => (),
+        }
+    }
+    parts
+}
+
+fn render_templ(
+    parts: &[TemplatePart],
+    variables: &IndexMap<String, Variable>,
+    page: Option<usize>,
+) -> String {
+    let mut result = String::new();
+    for p in parts {
+        match p {
+            TemplatePart::Lit(l) => result.push_str(l),
+            TemplatePart::Var(v) => result.push_str(
+                &variables
+                    .get(*v)
+                    .map(|x| x.value.clone())
+                    // maybe give error message if variable not found
+                    .unwrap_or(format!("{{{v}}}")),
+            ),
+            TemplatePart::Page(v, p) => {
+                if let Some(num) = page {
+                    result.push_str(v);
+                    result.push_str(&format!("{:0width$}", num, width = p))
+                }
+            }
+        }
+    }
+    result
+}
+
+fn numrng(rng: &str) -> Vec<usize> {
+    rng.split(",")
+        .map(|v| match v.split_once("-") {
+            Some((a, b)) => {
+                let a = a.parse::<usize>().unwrap();
+                let b = b.parse::<usize>().unwrap();
+                a..=b
+            }
+            None => {
+                let a = v.parse::<usize>().unwrap();
+                a..=a
+            }
+        })
+        .flatten()
+        .collect()
+}
+
+#[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+enum ExportFormat {
+    #[default]
+    Pdf,
+    Svg,
+    Png,
+}
+
+impl ExportFormat {
+    fn all() -> &'static [ExportFormat] {
+        &[ExportFormat::Pdf, ExportFormat::Svg, ExportFormat::Png]
+    }
+}
+
+impl std::fmt::Display for ExportFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            Self::Pdf => write!(f, "PDF"),
+            Self::Svg => write!(f, "SVG"),
+            Self::Png => write!(f, "PNG"),
+        }
+    }
 }
 
 enum Query {
@@ -91,6 +213,7 @@ impl Query {
                     text_input("Name", &name).on_input(Message::QueryStringEdit),
                     pick_list(alts, from.as_ref(), Message::QueryDropDownChanged),
                 ]
+                .width(Length::FillPortion(1))
                 .into(),
             ),
             Query::RenameAlternative(_, name) => (
@@ -100,6 +223,7 @@ impl Query {
                         .on_input(Message::QueryStringEdit)
                         .on_submit(Message::SubmitQuery)
                 ]
+                .width(Length::FillPortion(1))
                 .into(),
             ),
             Query::EditTemplate(content) => (
@@ -107,6 +231,7 @@ impl Query {
                 code_editor(&content)
                     .on_action(Message::QueryEditorAction)
                     .height(Length::Fill)
+                    .width(Length::FillPortion(4))
                     .into(),
             ),
             Query::EditDescription(content) => (
@@ -114,9 +239,51 @@ impl Query {
                 code_editor(&content)
                     .on_action(Message::QueryEditorAction)
                     .height(Length::Fill)
+                    .width(Length::FillPortion(1))
                     .into(),
             ),
-            Query::ExportFile(_) => ("Export File", text("todo").into()),
+            Query::ExportFile(opt) => (
+                "Export File",
+                column![
+                    row![
+                        text("Export Format:").width(Length::FillPortion(1)),
+                        pick_list(
+                            ExportFormat::all(),
+                            Some(&opt.format),
+                            Message::ExportFormatChanged
+                        )
+                        .width(Length::FillPortion(2)),
+                    ]
+                    .spacing(10)
+                    .width(Length::FillPortion(1)),
+                    row![
+                        text("File Name:").width(Length::FillPortion(1)),
+                        text_input("File Name", &opt.filename)
+                            .on_input(Message::QueryStringEdit)
+                            .width(Length::FillPortion(2)),
+                    ]
+                    .spacing(10)
+                    .width(Length::FillPortion(1)),
+                    row![
+                        text("Pages:").width(Length::FillPortion(1)),
+                        text_input("All Pages", &opt.pages)
+                            .on_input(Message::QueryString2Edit)
+                            .width(Length::FillPortion(2)),
+                    ]
+                    .spacing(10)
+                    .width(Length::FillPortion(1)),
+                    row![
+                        checkbox(opt.export_all)
+                            .label("Export All Alternatives")
+                            .on_toggle(Message::QueryCheckboxToggle)
+                            .width(Length::FillPortion(2)),
+                    ]
+                    .spacing(10)
+                    .width(Length::FillPortion(1))
+                ]
+                .spacing(10)
+                .into(),
+            ),
         };
         column![
             text(title),
@@ -144,7 +311,10 @@ enum Message {
     EditTemplate,
     QueryEditorAction(Action),
     QueryStringEdit(String),
+    QueryString2Edit(String),
     QueryDropDownChanged(String),
+    QueryCheckboxToggle(bool),
+    ExportFormatChanged(ExportFormat),
     ProjectNameChange(String),
     ProjectDescriptionChange(String),
     MultiLineDescription,
@@ -155,6 +325,7 @@ enum Message {
     EditVariableField(String),
     SubmitVariableEdit,
     NewVariable,
+    StartExport,
     RenameResource(usize),
     DeleteResource(usize),
     DownloadResource(usize),
@@ -231,6 +402,7 @@ impl State {
             Message::UploadFile(None) => (),
             Message::UploadFile(Some(filename)) => {
                 self.project.add_resource(filename);
+                self.engine.replace(self.project.typst_engine());
             }
             Message::RefreshPage => {
                 let alt = if let Some(alt) = &self.alternative {
@@ -244,7 +416,9 @@ impl State {
                     .map(|(k, v)| (k.as_str().into(), Value::Str(v.value.clone().into())))
                     .collect();
 
-                let eng = self.project.typst_engine();
+                let eng = self
+                    .engine
+                    .get_or_insert_with(|| self.project.typst_engine());
                 self.document = match eng.compile_with_input(vars).output {
                     Ok(s) => Some(s),
                     Err(e) => {
@@ -262,7 +436,6 @@ impl State {
                         }
                     };
                     let pixmap = typst_render::render(page, &opt);
-                    pixmap.save_png("test.png").unwrap();
                     self.page = Some(image::Handle::from_rgba(
                         pixmap.width(),
                         pixmap.height(),
@@ -273,27 +446,55 @@ impl State {
             Message::PageChange(new) => {
                 if let Some(d) = &self.document {
                     if let Ok(p) = new.parse::<usize>() {
-                        let total = d.pages().len();
-                        if p <= total && p > 0 {
-                            self.curr_page = p - 1;
-                            return Task::done(Message::RefreshPage);
+                        let opt = typst_render::RenderOptions::default();
+                        match d.pages().get(p - 1) {
+                            Some(page) => {
+                                self.curr_page = p - 1;
+                                let pixmap = typst_render::render(page, &opt);
+                                self.page = Some(image::Handle::from_rgba(
+                                    pixmap.width(),
+                                    pixmap.height(),
+                                    pixmap.data().to_vec(),
+                                ));
+                            }
+                            None => (),
                         }
+                        return Task::none();
                     }
                 }
             }
             Message::NextPage => {
                 if let Some(d) = &self.document {
-                    let total = d.pages().len();
-                    if self.curr_page < total {
-                        self.curr_page += 1;
-                        return Task::done(Message::RefreshPage);
+                    let opt = typst_render::RenderOptions::default();
+                    match d.pages().get(self.curr_page + 1) {
+                        Some(page) => {
+                            self.curr_page += 1;
+                            let pixmap = typst_render::render(page, &opt);
+                            self.page = Some(image::Handle::from_rgba(
+                                pixmap.width(),
+                                pixmap.height(),
+                                pixmap.data().to_vec(),
+                            ));
+                        }
+                        None => return Task::none(),
                     }
                 }
             }
             Message::PreviousPage => {
-                if self.curr_page > 0 {
-                    self.curr_page -= 1;
-                    return Task::done(Message::RefreshPage);
+                if let Some(d) = &self.document {
+                    let opt = typst_render::RenderOptions::default();
+                    match d.pages().get(self.curr_page - 1) {
+                        Some(page) => {
+                            self.curr_page -= 1;
+                            let pixmap = typst_render::render(page, &opt);
+                            self.page = Some(image::Handle::from_rgba(
+                                pixmap.width(),
+                                pixmap.height(),
+                                pixmap.data().to_vec(),
+                            ));
+                        }
+                        None => return Task::none(),
+                    }
                 }
             }
             Message::SubmitQuery => {
@@ -318,7 +519,54 @@ impl State {
                     Query::EditDescription(content) => {
                         self.project.metadata.description = content.text();
                     }
-                    Query::ExportFile(_) => (),
+                    Query::ExportFile(opt) => {
+                        if opt.export_all {
+                            //
+                        } else {
+                            if let Some(d) = &self.document {
+                                let mut templ = parse_templ(&opt.filename);
+                                match opt.format {
+                                    ExportFormat::Pdf => {
+                                        let options = Default::default();
+                                        let pdf = typst_pdf::pdf(d, &options)
+                                            .expect("Could not generate pdf.");
+                                        let filename = render_templ(&templ, self.variables(), None);
+                                        std::fs::write(
+                                            Path::new(&filename).with_extension("pdf"),
+                                            pdf,
+                                        )
+                                        .expect("Could not write pdf.");
+                                    }
+                                    ExportFormat::Png => {
+                                        if d.pages().len() > 1
+                                            && !templ
+                                                .iter()
+                                                .any(|t| matches!(t, TemplatePart::Page(..)))
+                                        {
+                                            // if no page part in template, add -###
+                                            templ.push(TemplatePart::Page("-", 3));
+                                        }
+                                        for (i, page) in d.pages().iter().enumerate() {
+                                            let opt = typst_render::RenderOptions::default();
+                                            let pixmap = typst_render::render(page, &opt);
+                                            let filename =
+                                                render_templ(&templ, self.variables(), Some(i));
+                                            pixmap
+                                                .save_png(
+                                                    Path::new(&filename).with_extension("png"),
+                                                )
+                                                .unwrap();
+                                        }
+                                    }
+                                    _ => (),
+                                }
+                            }
+                        }
+                        // update this for next time; doing it this
+                        // way so that cancelled Query doesn't
+                        // overwrite the export options in the project
+                        self.project.export_options = Some(opt);
+                    }
                 };
                 return Task::done(Message::RefreshPage);
             }
@@ -332,6 +580,43 @@ impl State {
                     }
                     Some(Query::RenameAlternative(ind, _)) => {
                         self.query = Some(Query::RenameAlternative(ind, val));
+                    }
+                    Some(Query::ExportFile(mut opt)) => {
+                        opt.filename = val;
+                        self.query = Some(Query::ExportFile(opt));
+                    }
+                    q => {
+                        self.query = q;
+                    }
+                };
+            }
+            Message::ExportFormatChanged(val) => {
+                match self.query.take() {
+                    Some(Query::ExportFile(mut opt)) => {
+                        opt.format = val;
+                        self.query = Some(Query::ExportFile(opt));
+                    }
+                    q => {
+                        self.query = q;
+                    }
+                };
+            }
+            Message::QueryString2Edit(val) => {
+                match self.query.take() {
+                    Some(Query::ExportFile(mut opt)) => {
+                        opt.pages = val;
+                        self.query = Some(Query::ExportFile(opt));
+                    }
+                    q => {
+                        self.query = q;
+                    }
+                };
+            }
+            Message::QueryCheckboxToggle(val) => {
+                match self.query.take() {
+                    Some(Query::ExportFile(mut opt)) => {
+                        opt.export_all = val;
+                        self.query = Some(Query::ExportFile(opt));
                     }
                     q => {
                         self.query = q;
@@ -361,6 +646,17 @@ impl State {
             }
             Message::NewAlternative => {
                 self.query = Some(Query::NewAlternative(String::new(), None));
+            }
+            Message::StartExport => {
+                let opt = self
+                    .project
+                    .export_options
+                    .clone()
+                    .unwrap_or_else(|| ExportOptions {
+                        filename: "document{-##}".into(),
+                        ..Default::default()
+                    });
+                self.query = Some(Query::ExportFile(opt));
             }
             Message::MultiLineDescription => {
                 self.query = Some(Query::EditDescription(Content::with_text(
@@ -504,7 +800,15 @@ impl State {
                         (!self.project.metadata.description.contains("\n"))
                             .then_some(Message::ProjectDescriptionChange)
                     ),
-                    button("…").on_press(Message::MultiLineDescription)
+                    tooltip(
+                        button("…").on_press_maybe(
+                            self.query.is_none().then(|| Message::MultiLineDescription)
+                        ),
+                        container(text(&self.project.metadata.description).width(300))
+                            .style(container::rounded_box)
+                            .padding(10),
+                        tooltip::Position::Top,
+                    )
                 ]
                 .width(Length::FillPortion(3)),
             ]
@@ -519,7 +823,8 @@ impl State {
                     )
                     .placeholder("Base Case")
                     .width(Length::Fill),
-                    button("+").on_press(Message::NewAlternative)
+                    button("+")
+                        .on_press_maybe(self.query.is_none().then(|| Message::NewAlternative))
                 ]
                 .width(Length::FillPortion(3)),
             ]
@@ -537,7 +842,8 @@ impl State {
             row![
                 text("Resources"),
                 horizontal().width(Length::Fill),
-                button("Upload").on_press(Message::UploadResource),
+                button("Upload")
+                    .on_press_maybe(self.query.is_none().then(|| Message::UploadResource)),
             ],
             container(
                 scrollable(
@@ -552,11 +858,12 @@ impl State {
             row![
                 button("Show Base Case").on_press(Message::ShowBaseCase),
                 horizontal().width(Length::Fill),
-                button("Edit Template").on_press(Message::EditTemplate),
+                button("Edit Template")
+                    .on_press_maybe(self.query.is_none().then(|| Message::EditTemplate)),
             ]
         ]
         .spacing(10)
-        .width(Length::FillPortion(1))
+        .width(Length::FillPortion(2))
         .into()
     }
 
@@ -568,7 +875,7 @@ impl State {
                 row![
                     button("Refresh").on_press(Message::RefreshPage),
                     horizontal().width(Length::Fill),
-                    button("Export")
+                    button("Export").on_press(Message::StartExport)
                 ],
                 row![
                     button("<").on_press(Message::PreviousPage),
@@ -585,7 +892,7 @@ impl State {
                 self.page()
             ]
             .spacing(25)
-            .width(Length::FillPortion(1))
+            .width(Length::FillPortion(2))
             .into()
         }
     }
@@ -608,6 +915,7 @@ struct Project {
     variables: Alternative,
     resources: IndexMap<String, Resource>,
     alternatives: IndexMap<String, Alternative>,
+    export_options: Option<ExportOptions>,
     // redundancy for the pick_list
     alt_list: Vec<String>,
 }
@@ -913,27 +1221,27 @@ impl Alternative {
                 })
                 .collect()
         };
-        vars.push(
-            row![
-                mouse_area(
-                    container(text("..New..").color(Color::WHITE.scale_alpha(0.4)))
+        if edit.is_none() {
+            vars.push(
+                row![
+                    mouse_area(
+                        container(text("..New..").color(Color::WHITE.scale_alpha(0.4)))
+                            .padding(5)
+                            .style(container::bordered_box)
+                            .width(Length::FillPortion(1))
+                    )
+                    .on_press(Message::NewVariable),
+                    container(horizontal())
                         .padding(5)
-                        .style(container::bordered_box)
-                        .width(Length::FillPortion(1))
-                )
-                .on_press(Message::NewVariable),
-                container(text("..Value..").color(Color::WHITE.scale_alpha(0.4)))
-                    .padding(5)
-                    .style(container::bordered_box)
-                    .width(Length::FillPortion(3)),
-                container(text("..Updated..").color(Color::WHITE.scale_alpha(0.4)))
-                    .padding(5)
-                    .style(container::bordered_box)
-                    .width(Length::FillPortion(1)),
-            ]
-            .spacing(10)
-            .into(),
-        );
+                        .width(Length::FillPortion(3)),
+                    container(horizontal())
+                        .padding(5)
+                        .width(Length::FillPortion(1)),
+                ]
+                .spacing(10)
+                .into(),
+            );
+        }
         iced::widget::Column::from_vec(vars)
             .width(Length::Fill)
             .spacing(5)
