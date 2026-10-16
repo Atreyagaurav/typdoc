@@ -381,7 +381,7 @@ enum Message {
     DownloadResource(usize),
     DownloadResourceTo(usize, Option<PathBuf>),
     UploadResource,
-    UploadFile(Option<PathBuf>),
+    UploadFiles(Option<Vec<PathBuf>>),
     NextPage,
     PreviousPage,
     PageChange(String),
@@ -463,7 +463,7 @@ impl State {
                 self.filepath = Some(path);
             }
             Message::UploadResource => {
-                return Task::perform(open_file_dialog(), Message::UploadFile);
+                return Task::perform(upload_files_dialog(), Message::UploadFiles);
             }
             Message::DownloadResource(ind) => {
                 return Task::perform(save_file_dialog(), move |p| {
@@ -480,9 +480,11 @@ impl State {
             Message::DeleteResource(ind) => {
                 _ = self.project.resources.shift_remove_index(ind);
             }
-            Message::UploadFile(None) => (),
-            Message::UploadFile(Some(filename)) => {
-                self.project.add_resource(filename);
+            Message::UploadFiles(None) => (),
+            Message::UploadFiles(Some(filenames)) => {
+                for fname in filenames {
+                    self.project.add_resource(fname);
+                }
                 self.engine.replace(self.project.typst_engine());
             }
             Message::RefreshPage => {
@@ -1373,6 +1375,14 @@ async fn open_file_dialog() -> Option<PathBuf> {
         .pick_file()
         .await
         .map(|p| p.into())
+}
+
+async fn upload_files_dialog() -> Option<Vec<PathBuf>> {
+    rfd::AsyncFileDialog::new()
+        .set_title("Upload a file")
+        .pick_files()
+        .await
+        .map(|p| p.into_iter().map(|p| p.into()).collect())
 }
 
 async fn save_file_dialog() -> Option<PathBuf> {
