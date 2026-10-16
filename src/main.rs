@@ -184,6 +184,53 @@ impl ExportFormat {
     fn all() -> &'static [ExportFormat] {
         &[ExportFormat::Pdf, ExportFormat::Svg, ExportFormat::Png]
     }
+
+    fn save_doc(
+        &self,
+        mut templ: Vec<TemplatePart>,
+        vars: &IndexMap<String, Variable>,
+        doc: &PagedDocument,
+    ) {
+        match self {
+            ExportFormat::Pdf => {
+                let options = Default::default();
+                let pdf = typst_pdf::pdf(doc, &options).expect("Could not generate pdf.");
+                let filename = render_templ(&templ, vars, None);
+                std::fs::write(Path::new(&filename).with_extension("pdf"), pdf)
+                    .expect("Could not write pdf.");
+            }
+            ExportFormat::Png => {
+                if doc.pages().len() > 1
+                    && !templ.iter().any(|t| matches!(t, TemplatePart::Page(..)))
+                {
+                    // if no page part in template, add -###
+                    templ.push(TemplatePart::Page("-", 3));
+                }
+                let opt = typst_render::RenderOptions::default();
+                for (i, page) in doc.pages().iter().enumerate() {
+                    let pixmap = typst_render::render(page, &opt);
+                    let filename = render_templ(&templ, vars, Some(i));
+                    pixmap
+                        .save_png(Path::new(&filename).with_extension("png"))
+                        .unwrap();
+                }
+            }
+            ExportFormat::Svg => {
+                if doc.pages().len() > 1
+                    && !templ.iter().any(|t| matches!(t, TemplatePart::Page(..)))
+                {
+                    // if no page part in template, add -###
+                    templ.push(TemplatePart::Page("-", 3));
+                }
+                let opt = typst_svg::SvgOptions::default();
+                for (i, page) in doc.pages().iter().enumerate() {
+                    let svg = typst_svg::svg(page, &opt);
+                    let filename = render_templ(&templ, vars, Some(i));
+                    std::fs::write(Path::new(&filename).with_extension("png"), svg).unwrap();
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for ExportFormat {
@@ -304,7 +351,10 @@ impl Query {
 #[derive(Clone)]
 enum Message {
     OpenProject,
+    OpenFile(Option<PathBuf>),
     SaveProject,
+    SaveAsProject,
+    SaveAsFile(Option<PathBuf>),
     RefreshPage,
     SubmitQuery,
     CancelQuery,
@@ -329,6 +379,7 @@ enum Message {
     RenameResource(usize),
     DeleteResource(usize),
     DownloadResource(usize),
+    DownloadResourceTo(usize, Option<PathBuf>),
     UploadResource,
     UploadFile(Option<PathBuf>),
     NextPage,
@@ -388,16 +439,46 @@ impl State {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::OpenProject => {
-                self.project = Project::from_file("test.typdoc".as_ref()).unwrap();
+                return Task::perform(open_file_dialog(), Message::OpenFile);
+            }
+            Message::OpenFile(Some(path)) => {
+                self.project = Project::from_file(&path).unwrap();
+                self.filepath = Some(path);
                 self.query = None;
                 self.edit_variable = None;
                 return Task::done(Message::RefreshPage);
             }
             Message::SaveProject => {
-                self.project.save_file("test.typdoc".as_ref()).unwrap();
+                if let Some(path) = &self.filepath {
+                    self.project.save_file(path).unwrap();
+                } else {
+                    return Task::done(Message::SaveAsProject);
+                }
+            }
+            Message::SaveAsProject => {
+                return Task::perform(save_file_dialog(), Message::SaveAsFile);
+            }
+            Message::SaveAsFile(Some(path)) => {
+                self.project.save_file(&path).unwrap();
+                self.filepath = Some(path);
             }
             Message::UploadResource => {
-                return Task::perform(upload_file_dialog(), Message::UploadFile);
+                return Task::perform(open_file_dialog(), Message::UploadFile);
+            }
+            Message::DownloadResource(ind) => {
+                return Task::perform(save_file_dialog(), move |p| {
+                    Message::DownloadResourceTo(ind, p)
+                });
+            }
+            Message::DownloadResourceTo(ind, Some(path)) => {
+                std::fs::write(
+                    path,
+                    &self.project.resources.get_index(ind).unwrap().1.contents,
+                )
+                .unwrap();
+            }
+            Message::DeleteResource(ind) => {
+                _ = self.project.resources.shift_remove_index(ind);
             }
             Message::UploadFile(None) => (),
             Message::UploadFile(Some(filename)) => {
@@ -521,45 +602,34 @@ impl State {
                     }
                     Query::ExportFile(opt) => {
                         if opt.export_all {
-                            //
+                            let variables =
+                                self.project.alternatives.values().map(|a| &a.variables);
+                            for alt_vars in variables {
+                                let vars: Dict = alt_vars
+                                    .iter()
+                                    .map(|(k, v)| {
+                                        (k.as_str().into(), Value::Str(v.value.clone().into()))
+                                    })
+                                    .collect();
+
+                                let eng = self
+                                    .engine
+                                    .get_or_insert_with(|| self.project.typst_engine());
+                                match eng.compile_with_input(vars).output {
+                                    Ok(doc) => {
+                                        let templ = parse_templ(&opt.filename);
+                                        opt.format.save_doc(templ, alt_vars, &doc);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error compiling: {e:?}");
+                                        break;
+                                    }
+                                };
+                            }
                         } else {
                             if let Some(d) = &self.document {
-                                let mut templ = parse_templ(&opt.filename);
-                                match opt.format {
-                                    ExportFormat::Pdf => {
-                                        let options = Default::default();
-                                        let pdf = typst_pdf::pdf(d, &options)
-                                            .expect("Could not generate pdf.");
-                                        let filename = render_templ(&templ, self.variables(), None);
-                                        std::fs::write(
-                                            Path::new(&filename).with_extension("pdf"),
-                                            pdf,
-                                        )
-                                        .expect("Could not write pdf.");
-                                    }
-                                    ExportFormat::Png => {
-                                        if d.pages().len() > 1
-                                            && !templ
-                                                .iter()
-                                                .any(|t| matches!(t, TemplatePart::Page(..)))
-                                        {
-                                            // if no page part in template, add -###
-                                            templ.push(TemplatePart::Page("-", 3));
-                                        }
-                                        for (i, page) in d.pages().iter().enumerate() {
-                                            let opt = typst_render::RenderOptions::default();
-                                            let pixmap = typst_render::render(page, &opt);
-                                            let filename =
-                                                render_templ(&templ, self.variables(), Some(i));
-                                            pixmap
-                                                .save_png(
-                                                    Path::new(&filename).with_extension("png"),
-                                                )
-                                                .unwrap();
-                                        }
-                                    }
-                                    _ => (),
-                                }
+                                let templ = parse_templ(&opt.filename);
+                                opt.format.save_doc(templ, self.variables(), d);
                             }
                         }
                         // update this for next time; doing it this
@@ -926,17 +996,12 @@ impl Project {
             return;
         }
 
-        match from {
-            Some(f) => {
-                let mut old = self.alternatives[&f].clone();
-                old.name = name.clone();
-                self.alternatives.insert(name.clone(), old);
-            }
-            None => {
-                self.alternatives
-                    .insert(name.clone(), Alternative::new(name.clone()));
-            }
-        }
+        let mut old = match from {
+            Some(f) => self.alternatives[&f].clone(),
+            None => self.variables.clone(),
+        };
+        old.name = name.clone();
+        self.alternatives.insert(name.clone(), old);
         self.alt_list.push(name);
     }
 
@@ -1302,7 +1367,7 @@ impl Variable {
     }
 }
 
-async fn upload_file_dialog() -> Option<PathBuf> {
+async fn open_file_dialog() -> Option<PathBuf> {
     rfd::AsyncFileDialog::new()
         .set_title("Upload a file")
         .pick_file()
