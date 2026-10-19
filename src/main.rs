@@ -2,8 +2,8 @@ use chrono::{DateTime, Local, Utc};
 use core::num::NonZero;
 use iced::Element;
 use iced::widget::{
-    button, center, checkbox, column, container, image, mouse_area, operation::focus, pick_list,
-    row, scrollable, space::horizontal, text, text_input, tooltip,
+    button, checkbox, column, container, image, mouse_area, operation::focus, pick_list, row,
+    scrollable, slider, space::horizontal, text, text_input, tooltip,
 };
 use iced::{Color, Length, Task};
 use indexmap::{IndexMap, map::MutableEntryKey};
@@ -46,6 +46,7 @@ struct State {
     edit_variable: Option<(usize, bool, String)>,
     page: Option<image::Handle>,
     curr_page: usize,
+    pix_pt: f64,
     query: Option<Query>,
 }
 
@@ -53,7 +54,13 @@ impl State {
     fn new() -> (Self, Task<Message>) {
         let args: Vec<String> = std::env::args().skip(1).collect();
         match args.as_slice() {
-            [] => (State::default(), Task::none()),
+            [] => (
+                State {
+                    pix_pt: 1.0,
+                    ..Default::default()
+                },
+                Task::none(),
+            ),
             [path] => {
                 let ext = Path::new(path).extension().map(|s| s.to_string_lossy());
                 let project = match ext.as_deref() {
@@ -73,6 +80,7 @@ impl State {
                     State {
                         project,
                         engine,
+                        pix_pt: 1.0,
                         ..Default::default()
                     },
                     Task::done(Message::RefreshPage),
@@ -296,12 +304,17 @@ impl std::fmt::Display for ExportFormat {
     }
 }
 
+struct PreviewSettings {
+    pix_pt: f64,
+}
+
 enum Query {
     NewAlternative(String, Option<String>),
     RenameAlternative(usize, String),
     EditTemplate(Content),
     EditDescription(Content),
     ExportFile(ExportOptions),
+    PreviewSettings(PreviewSettings),
 }
 
 impl Query {
@@ -385,6 +398,17 @@ impl Query {
                 .spacing(10)
                 .into(),
             ),
+            Query::PreviewSettings(settings) => (
+                "Preview Settings",
+                row![
+                    text("Pixel/Pt"),
+                    slider(0.1..=20.0, settings.pix_pt, Message::QueryPixPtChange),
+                    text(settings.pix_pt),
+                ]
+                .spacing(20)
+                .width(Length::FillPortion(2))
+                .into(),
+            ),
         };
         column![
             text(title),
@@ -413,11 +437,13 @@ enum Message {
     SubmitQuery,
     CancelQuery,
     EditTemplate,
+    PreviewSettings,
     QueryEditorAction(Action),
     QueryStringEdit(String),
     QueryString2Edit(String),
     QueryDropDownChanged(String),
     QueryCheckboxToggle(bool),
+    QueryPixPtChange(f64),
     ExportFormatChanged(ExportFormat),
     ProjectNameChange(String),
     ProjectDescriptionChange(String),
@@ -453,35 +479,45 @@ impl State {
     }
 
     fn apply_variable_change(&mut self) -> bool {
-        let (alt, is_base) = if let Some(alt) = &self.alternative {
-            (&mut self.project.alternatives[alt], false)
-        } else {
-            (&mut self.project.variables, true)
-        };
-        // TODO: if basecase variable is edited; apply it across all alternatives
-        // if name changed, change the name in all alternatives
-        // if value changed, change the values only if it's the same value in those alternatives
-        // if new variable, then add it on all the alternatives with default value
         match self.edit_variable.take() {
             None => true,
             Some((ind, true, val)) => {
-                // change name
+                // change name; if base case rename the variable in all alternatives
+                // TODO: it should only happen when we're on basecase
                 let val = val.trim();
-                if alt.variables.replace_index(ind, val.to_string()).is_ok() {
-                    let v = &mut alt.variables[val];
-                    if v.name != val {
-                        v.name = val.to_string();
-                        v.last_modified = Utc::now();
-                        v.modified_by = current_user!();
+
+                if let Some(alt) = &self.alternative {
+                    if !self.project.alternatives[alt].set_name(ind, val) {
+                        self.edit_variable = Some((ind, true, val.to_string()));
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    let old = self
+                        .project
+                        .variables
+                        .variables
+                        .get_index(ind)
+                        .map(|(k, _)| k.to_string())
+                        .unwrap_or_default();
+                    if !self.project.variables.set_name(ind, val) {
+                        self.edit_variable = Some((ind, true, val.to_string()));
+                        return false;
+                    }
+                    for alt in self.project.alternatives.values_mut() {
+                        alt.rename(&old, val);
                     }
                     true
-                } else {
-                    self.edit_variable = Some((ind, true, val.to_string()));
-                    false
                 }
             }
             Some((ind, false, val)) => {
-                // change value
+                // change value; simply replace the value
+                let alt = if let Some(alt) = &self.alternative {
+                    &mut self.project.alternatives[alt]
+                } else {
+                    &mut self.project.variables
+                };
                 if let Some((_, v)) = alt.variables.get_index_mut(ind) {
                     if v.value != val {
                         v.value = val;
@@ -585,7 +621,7 @@ impl State {
                 };
                 if let Some(doc) = &self.document {
                     let opt = typst_render::RenderOptions {
-                        pixel_per_pt: typst::utils::Scalar::ONE,
+                        pixel_per_pt: self.pix_pt.into(),
                         ..Default::default()
                     };
                     let page = match doc.pages().get(self.curr_page) {
@@ -718,6 +754,9 @@ impl State {
                         // overwrite the export options in the project
                         self.project.export_options = Some(opt);
                     }
+                    Query::PreviewSettings(set) => {
+                        self.pix_pt = set.pix_pt;
+                    }
                 };
                 return Task::done(Message::RefreshPage);
             }
@@ -763,6 +802,17 @@ impl State {
                     }
                 };
             }
+            Message::QueryPixPtChange(val) => {
+                match self.query.take() {
+                    Some(Query::PreviewSettings(mut set)) => {
+                        set.pix_pt = val;
+                        self.query = Some(Query::PreviewSettings(set));
+                    }
+                    q => {
+                        self.query = q;
+                    }
+                };
+            }
             Message::QueryCheckboxToggle(val) => {
                 match self.query.take() {
                     Some(Query::ExportFile(mut opt)) => {
@@ -797,6 +847,11 @@ impl State {
             }
             Message::NewAlternative => {
                 self.query = Some(Query::NewAlternative(String::new(), None));
+            }
+            Message::PreviewSettings => {
+                self.query = Some(Query::PreviewSettings(PreviewSettings {
+                    pix_pt: self.pix_pt,
+                }));
             }
             Message::StartExport => {
                 let opt = self
@@ -1105,6 +1160,11 @@ impl State {
                     .spacing(25)
                     .height(25),
                     horizontal().width(Length::FillPortion(1)),
+                    icons::action(
+                        icons::cog_icon(),
+                        "Preview Settings",
+                        (!self.has_query()).then_some(Message::PreviewSettings)
+                    ),
                     icons::action(
                         icons::file_pdf_icon(),
                         "Export",
@@ -1482,6 +1542,38 @@ impl Alternative {
         Alternative {
             name,
             variables: IndexMap::new(),
+        }
+    }
+
+    fn set_name(&mut self, index: usize, name: &str) -> bool {
+        if self
+            .variables
+            .replace_index(index, name.to_string())
+            .is_ok()
+        {
+            let v = &mut self.variables[name];
+            if v.name != name {
+                v.name = name.to_string();
+                v.last_modified = Utc::now();
+                v.modified_by = current_user!();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn rename(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        if let Some(index) = self.variables.get_index_of(old) {
+            if self.variables.replace_index(index, new.to_string()).is_ok() {
+                let v = &mut self.variables[new];
+                v.name = new.to_string();
+                v.last_modified = Utc::now();
+                v.modified_by = current_user!();
+            }
         }
     }
 }
