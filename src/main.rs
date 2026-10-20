@@ -36,6 +36,18 @@ fn main() {
         .unwrap()
 }
 
+enum EditableVariable {
+    VariableName,
+    VariableValue,
+    ResourceName,
+}
+
+struct CurrentlyEditing {
+    variable: EditableVariable,
+    index: usize,
+    value: String,
+}
+
 #[derive(Default)]
 struct State {
     filepath: Option<PathBuf>,
@@ -43,7 +55,7 @@ struct State {
     engine: Option<TypstEngine<TypstTemplateMainFile>>,
     document: Option<PagedDocument>,
     alternative: Option<String>,
-    edit_variable: Option<(usize, bool, String)>,
+    editing: Option<CurrentlyEditing>,
     page: Option<image::Handle>,
     curr_page: usize,
     pix_pt: f64,
@@ -310,7 +322,7 @@ struct PreviewSettings {
 
 enum Query {
     NewAlternative(String, Option<String>),
-    RenameAlternative(usize, String),
+    RenameAlternative(String, String),
     EditTemplate(Content),
     EditDescription(Content),
     ExportFile(ExportOptions),
@@ -323,19 +335,28 @@ impl Query {
             Query::NewAlternative(name, from) => (
                 "Add a new Alternative",
                 row![
-                    text_input("Name", &name).on_input(Message::QueryStringEdit),
+                    text_input("Name:", &name).on_input(Message::QueryStringEdit),
                     pick_list(alts, from.as_ref(), Message::QueryDropDownChanged),
                 ]
                 .width(Length::FillPortion(2))
                 .into(),
             ),
-            Query::RenameAlternative(_, name) => (
+            Query::RenameAlternative(old, name) => (
                 "Rename Alternative",
-                row![
-                    text_input("Name", &name)
-                        .on_input(Message::QueryStringEdit)
-                        .on_submit(Message::SubmitQuery)
+                column![
+                    row![
+                        text("Old Name:").width(Length::FillPortion(1)),
+                        text(old).width(Length::FillPortion(2))
+                    ],
+                    row![
+                        text("New Name:").width(Length::FillPortion(1)),
+                        text_input("Name", &name)
+                            .on_input(Message::QueryStringEdit)
+                            .on_submit(Message::SubmitQuery)
+                            .width(Length::FillPortion(2))
+                    ]
                 ]
+                .spacing(20)
                 .width(Length::FillPortion(2))
                 .into(),
             ),
@@ -450,6 +471,7 @@ enum Message {
     MultiLineDescription,
     ShowBaseCase,
     NewAlternative,
+    RenameAlternative,
     AlternativeSelect(String),
     StartEdit(usize, bool),
     EditVariableField(String),
@@ -478,57 +500,82 @@ impl State {
         State::new()
     }
 
-    fn apply_variable_change(&mut self) -> bool {
-        match self.edit_variable.take() {
-            None => true,
-            Some((ind, true, val)) => {
-                // change name; if base case rename the variable in all alternatives
-                // TODO: it should only happen when we're on basecase
-                let val = val.trim();
+    fn finish_editing(&mut self) -> bool {
+        if let Some(editing) = self.editing.take() {
+            match &editing.variable {
+                EditableVariable::VariableName => {
+                    // change name; if defaults rename the variable in all alternatives
+                    // TODO: it should only happen when we're on defaults
+                    let val = editing.value.trim();
 
-                if let Some(alt) = &self.alternative {
-                    if !self.project.alternatives[alt].set_name(ind, val) {
-                        self.edit_variable = Some((ind, true, val.to_string()));
-                        false
+                    if let Some(alt) = &self.alternative {
+                        if !self.project.alternatives[alt].set_name(editing.index, val) {
+                            false
+                        } else {
+                            self.editing = Some(editing);
+                            true
+                        }
+                    } else {
+                        let old = self
+                            .project
+                            .variables
+                            .variables
+                            .get_index(editing.index)
+                            .map(|(k, _)| k.to_string())
+                            .unwrap_or_default();
+                        if !self.project.variables.set_name(editing.index, val) {
+                            self.editing = Some(editing);
+                            return false;
+                        }
+                        for alt in self.project.alternatives.values_mut() {
+                            alt.rename(&old, val);
+                        }
+                        true
+                    }
+                }
+                EditableVariable::VariableValue => {
+                    // change value; simply replace the value
+                    let alt = if let Some(alt) = &self.alternative {
+                        &mut self.project.alternatives[alt]
+                    } else {
+                        &mut self.project.variables
+                    };
+                    if let Some((_, v)) = alt.variables.get_index_mut(editing.index) {
+                        if v.value != editing.value {
+                            v.value = editing.value;
+                            v.last_modified = Utc::now();
+                            v.modified_by = current_user!();
+                        }
+                        true
                     } else {
                         true
                     }
-                } else {
-                    let old = self
+                }
+                EditableVariable::ResourceName => {
+                    if self
                         .project
-                        .variables
-                        .variables
-                        .get_index(ind)
-                        .map(|(k, _)| k.to_string())
-                        .unwrap_or_default();
-                    if !self.project.variables.set_name(ind, val) {
-                        self.edit_variable = Some((ind, true, val.to_string()));
-                        return false;
+                        .resources
+                        .replace_index(editing.index, editing.value.to_string())
+                        .is_ok()
+                    {
+                        if let Some((_, v)) = self.project.resources.get_index_mut(editing.index) {
+                            if v.path != editing.value {
+                                v.path = PathBuf::from(editing.value);
+                                v.last_modified = Utc::now();
+                                self.engine = None;
+                                self.document = None;
+                            }
+                            true
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
                     }
-                    for alt in self.project.alternatives.values_mut() {
-                        alt.rename(&old, val);
-                    }
-                    true
                 }
             }
-            Some((ind, false, val)) => {
-                // change value; simply replace the value
-                let alt = if let Some(alt) = &self.alternative {
-                    &mut self.project.alternatives[alt]
-                } else {
-                    &mut self.project.variables
-                };
-                if let Some((_, v)) = alt.variables.get_index_mut(ind) {
-                    if v.value != val {
-                        v.value = val;
-                        v.last_modified = Utc::now();
-                        v.modified_by = current_user!();
-                    }
-                    true
-                } else {
-                    true
-                }
-            }
+        } else {
+            true
         }
     }
 
@@ -541,7 +588,7 @@ impl State {
                 self.project = Project::from_typdoc_file(&path).unwrap();
                 self.filepath = Some(path);
                 self.query = None;
-                self.edit_variable = None;
+                self.editing = None;
                 self.engine = None;
                 self.document = None;
                 return Task::done(Message::RefreshPage);
@@ -704,8 +751,8 @@ impl State {
                         self.project.add_alternative(name.clone(), from);
                         self.alternative = Some(name)
                     }
-                    Query::RenameAlternative(ind, name) => {
-                        self.project.rename_alternative(ind, name.clone());
+                    Query::RenameAlternative(old, name) => {
+                        self.project.rename_alternative(&old, name.clone());
                         self.alternative = Some(name)
                     }
                     Query::EditTemplate(content) => {
@@ -768,8 +815,8 @@ impl State {
                     Some(Query::NewAlternative(_, from)) => {
                         self.query = Some(Query::NewAlternative(val, from));
                     }
-                    Some(Query::RenameAlternative(ind, _)) => {
-                        self.query = Some(Query::RenameAlternative(ind, val));
+                    Some(Query::RenameAlternative(old, _)) => {
+                        self.query = Some(Query::RenameAlternative(old, val));
                     }
                     Some(Query::ExportFile(mut opt)) => {
                         opt.filename = val;
@@ -848,6 +895,11 @@ impl State {
             Message::NewAlternative => {
                 self.query = Some(Query::NewAlternative(String::new(), None));
             }
+            Message::RenameAlternative => {
+                if let Some(alt) = &self.alternative {
+                    self.query = Some(Query::RenameAlternative(alt.to_string(), alt.to_string()));
+                }
+            }
             Message::PreviewSettings => {
                 self.query = Some(Query::PreviewSettings(PreviewSettings {
                     pix_pt: self.pix_pt,
@@ -879,30 +931,33 @@ impl State {
                 return Task::done(Message::RefreshPage);
             }
             Message::EditVariableField(fd) => {
-                if let Some((_, _, val)) = &mut self.edit_variable {
-                    *val = fd;
+                if let Some(var) = &mut self.editing {
+                    var.value = fd;
                 }
             }
             Message::SubmitVariableEdit => {
-                if self.apply_variable_change() {
+                if self.finish_editing() {
                     return Task::done(Message::RefreshPage);
                 }
             }
             Message::NewVariable => {
-                self.apply_variable_change();
-                if self.edit_variable.is_none() {
+                self.finish_editing();
+                if self.editing.is_none() {
                     if let Some(alt) = &self.alternative {
-                        self.edit_variable = Some((
-                            self.project.alternatives[alt].variables.len(),
-                            true,
-                            String::new(),
-                        ));
+                        self.editing = Some(CurrentlyEditing {
+                            variable: EditableVariable::VariableName,
+                            index: self.project.alternatives[alt].variables.len(),
+                            value: String::new(),
+                        });
                         self.project.alternatives[alt]
                             .variables
                             .insert(String::new(), Variable::default());
                     } else {
-                        self.edit_variable =
-                            Some((self.project.variables.variables.len(), true, String::new()));
+                        self.editing = Some(CurrentlyEditing {
+                            variable: EditableVariable::VariableName,
+                            index: self.project.variables.variables.len(),
+                            value: String::new(),
+                        });
                         self.project
                             .variables
                             .variables
@@ -911,9 +966,25 @@ impl State {
                     return focus("currentEdit");
                 }
             }
+            Message::RenameResource(ind) => {
+                self.finish_editing();
+                if self.editing.is_none() {
+                    self.editing = Some(CurrentlyEditing {
+                        variable: EditableVariable::ResourceName,
+                        index: ind,
+                        value: self
+                            .project
+                            .resources
+                            .get_index(ind)
+                            .map(|(r, _)| r.to_string())
+                            .unwrap_or_default(),
+                    });
+                    return focus("currentEdit");
+                }
+            }
             Message::StartEdit(ind, key) => {
-                self.apply_variable_change();
-                if self.edit_variable.is_none() {
+                self.finish_editing();
+                if self.editing.is_none() {
                     let alt = if let Some(alt) = &self.alternative {
                         &self.project.alternatives[alt]
                     } else {
@@ -925,7 +996,15 @@ impl State {
                         } else {
                             v.value.to_string()
                         };
-                        self.edit_variable = Some((ind, key, val));
+                        self.editing = Some(CurrentlyEditing {
+                            variable: if key {
+                                EditableVariable::VariableName
+                            } else {
+                                EditableVariable::VariableValue
+                            },
+                            index: ind,
+                            value: val,
+                        });
                         return focus("currentEdit");
                     }
                 }
@@ -969,19 +1048,33 @@ impl State {
                 .iter()
                 .enumerate()
                 .map(|(i, (k, v))| {
+                    let name: Element<_> = match &self.editing {
+                        Some(CurrentlyEditing {
+                            variable: EditableVariable::ResourceName,
+                            index,
+                            value,
+                        }) if index == &i => text_input("Name", value)
+                            .id("currentEdit")
+                            .on_input(Message::EditVariableField)
+                            .on_submit(Message::SubmitVariableEdit)
+                            .width(Length::FillPortion(2))
+                            .into(),
+                        _ => mouse_area(
+                            container(text(k))
+                                .padding(5)
+                                .style(container::bordered_box)
+                                .width(Length::FillPortion(2)),
+                        )
+                        .on_press(Message::RenameResource(i))
+                        .into(),
+                    };
                     row![
                         icons::action(
                             icons::download_icon(),
                             "Download",
                             Some(Message::DownloadResource(i))
                         ),
-                        mouse_area(
-                            container(text(k))
-                                .padding(5)
-                                .style(container::bordered_box)
-                                .width(Length::FillPortion(2))
-                        )
-                        .on_press(Message::RenameResource(i)),
+                        name,
                         tooltip(
                             container(text(v.relative_time()))
                                 .padding(5)
@@ -1079,8 +1172,13 @@ impl State {
                             self.alternative.as_ref(),
                             Message::AlternativeSelect
                         )
-                        .placeholder("Base Case")
+                        .placeholder("Default")
                         .width(Length::Fill),
+                        icons::action(
+                            icons::pencil_icon(),
+                            "Edit Alternative",
+                            Some(Message::RenameAlternative)
+                        ),
                         icons::action(
                             icons::add_new_icon(),
                             "Add New Alternative",
@@ -1093,8 +1191,8 @@ impl State {
                 text("Variables"),
                 container(
                     scrollable(match &self.alternative {
-                        Some(alt) => self.project.alternatives[alt].view(&self.edit_variable),
-                        None => self.project.variables.view(&self.edit_variable),
+                        Some(alt) => self.project.alternatives[alt].view(&self.editing),
+                        None => self.project.variables.view(&self.editing),
                     })
                     .height(Length::FillPortion(1))
                 )
@@ -1120,7 +1218,7 @@ impl State {
                 .style(container::bordered_box)
                 .padding(5),
                 row![
-                    button("Show Base Case").on_press(Message::ShowBaseCase),
+                    button("Show Defaults").on_press(Message::ShowBaseCase),
                     horizontal().width(Length::Fill),
                     button("Edit Template")
                         .on_press_maybe(self.query.is_none().then(|| Message::EditTemplate)),
@@ -1221,19 +1319,28 @@ impl Project {
         self.alt_list.push(name);
     }
 
-    fn rename_alternative(&mut self, index: usize, name: String) {
+    fn rename_alternative(&mut self, old: &str, name: String) -> bool {
         if self.alternatives.contains_key(&name) {
-            return;
+            return false;
         }
-
-        match self.alternatives.get_index_entry(index) {
-            Some(mut f) => {
-                *f.key_mut() = name.clone();
-                self.alt_list[index] = name;
+        if let Some(index) = self.alternatives.get_index_of(old) {
+            if self
+                .alternatives
+                .replace_index(index, name.clone())
+                .is_err()
+            {
+                return false;
             }
-            None => {
-                return;
+            match self.alternatives.get_index_entry(index) {
+                Some(mut f) => {
+                    *f.key_mut() = name.clone();
+                    self.alt_list[index] = name;
+                    true
+                }
+                None => false,
             }
+        } else {
+            false
         }
     }
 
@@ -1389,14 +1496,23 @@ impl Default for Alternative {
 }
 
 impl Alternative {
-    fn view<'a>(&'a self, edit: &Option<(usize, bool, String)>) -> Element<'a, Message> {
-        let mut vars: Vec<Element<_>> = if let Some((ind, key, val)) = edit {
+    fn view<'a>(&'a self, edit: &Option<CurrentlyEditing>) -> Element<'a, Message> {
+        let edits = edit
+            .as_ref()
+            .map(|e| match &e.variable {
+                EditableVariable::VariableName => Some((e.index, true, &e.value)),
+                EditableVariable::VariableValue => Some((e.index, false, &e.value)),
+                _ => None,
+            })
+            .flatten();
+
+        let mut vars: Vec<Element<_>> = if let Some((ind, key, val)) = edits {
             self.variables
                 .iter()
                 .enumerate()
                 .map(|(i, (k, v))| {
-                    if &i == ind {
-                        if *key {
+                    if i == ind {
+                        if key {
                             row![
                                 text_input("Name", val)
                                     .id("currentEdit")
@@ -1509,7 +1625,8 @@ impl Alternative {
                 })
                 .collect()
         };
-        if edit.is_none() {
+        if !self.variables.contains_key("") {
+            // If there is empty variable, then we can't add more empty ones
             vars.push(
                 row![
                     mouse_area(
