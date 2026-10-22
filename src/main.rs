@@ -3,7 +3,7 @@ use core::num::NonZero;
 use iced::Element;
 use iced::widget::{
     button, checkbox, column, container, image, mouse_area, operation::focus, pick_list, row,
-    scrollable, space::horizontal, text, text_input, tooltip,
+    scrollable, space::horizontal, text, text::Rich, text_input, tooltip,
 };
 use iced::{Color, Length, Task};
 use iced_palace::widget::{ellipsized_text, labeled_slider};
@@ -57,7 +57,7 @@ struct State {
     document: Option<PagedDocument>,
     alternative: Option<String>,
     editing: Option<CurrentlyEditing>,
-    page: Result<image::Handle, String>,
+    page: Result<image::Handle, error::TypstError>,
     curr_page: usize,
     pix_pt: f64,
     query: Option<Query>,
@@ -72,7 +72,7 @@ impl Default for State {
             document: None,
             alternative: None,
             editing: None,
-            page: Err("No File".into()),
+            page: Err(error::TypstError::default()),
             curr_page: 0,
             pix_pt: 1.0,
             query: None,
@@ -1306,9 +1306,8 @@ impl State {
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
-            Err(e) => text(e)
+            Err(e) => Rich::with_spans(&e.errors)
                 .font(iced::font::Font::MONOSPACE)
-                .style(text::danger)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
