@@ -3,9 +3,10 @@ use core::num::NonZero;
 use iced::Element;
 use iced::widget::{
     button, checkbox, column, container, image, mouse_area, operation::focus, pick_list, row,
-    scrollable, slider, space::horizontal, text, text_input, tooltip,
+    scrollable, space::horizontal, text, text_input, tooltip,
 };
 use iced::{Color, Length, Task};
+use iced_palace::widget::{ellipsized_text, labeled_slider};
 use indexmap::{IndexMap, map::MutableEntryKey};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -13,12 +14,13 @@ use std::path::PathBuf;
 use std::{fs::File, path::Path};
 use typst::foundations::{Dict, Value};
 use typst::layout::{PageRange, PageRanges};
-use typst_as_lib::{TypstEngine, TypstTemplateMainFile};
+use typst_as_lib::{TypstAsLibError, TypstEngine, TypstTemplateMainFile, TypstWorldBuilder};
 use typst_iced_editor::{Action, Content, code_editor};
 use typst_layout::PagedDocument;
 use zip::ZipWriter;
 use zip::read::ZipArchive;
 use zip::write::FileOptions;
+mod error;
 mod icons;
 
 macro_rules! current_user {
@@ -48,7 +50,6 @@ struct CurrentlyEditing {
     value: String,
 }
 
-#[derive(Default)]
 struct State {
     filepath: Option<PathBuf>,
     project: Project,
@@ -56,10 +57,27 @@ struct State {
     document: Option<PagedDocument>,
     alternative: Option<String>,
     editing: Option<CurrentlyEditing>,
-    page: Option<image::Handle>,
+    page: Result<image::Handle, String>,
     curr_page: usize,
     pix_pt: f64,
     query: Option<Query>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            filepath: None,
+            project: Project::default(),
+            engine: None,
+            document: None,
+            alternative: None,
+            editing: None,
+            page: Err("No File".into()),
+            curr_page: 0,
+            pix_pt: 1.0,
+            query: None,
+        }
+    }
 }
 
 impl State {
@@ -421,11 +439,13 @@ impl Query {
             ),
             Query::PreviewSettings(settings) => (
                 "Preview Settings",
-                row![
-                    text("Pixel/Pt"),
-                    slider(0.1..=20.0, settings.pix_pt, Message::QueryPixPtChange),
-                    text(settings.pix_pt),
-                ]
+                row![labeled_slider(
+                    "Pixel per Point",
+                    (0.1..=20.0, 0.1),
+                    settings.pix_pt,
+                    Message::QueryPixPtChange,
+                    |a| format!("{:.1}", a)
+                ),]
                 .spacing(20)
                 .width(Length::FillPortion(2))
                 .into(),
@@ -652,17 +672,18 @@ impl State {
 
                 let output = if let Some(cont) = self.edit_template() {
                     let eng = self.project.typst_engine(cont.text());
-                    eng.compile_with_input(vars).output
+                    error::compile_typst(&eng, vars)
                 } else {
                     let eng = self.engine.get_or_insert_with(|| {
                         self.project.typst_engine(self.project.template.clone())
                     });
-                    eng.compile_with_input(vars).output
+                    error::compile_typst(eng, vars)
                 };
+
                 self.document = match output {
                     Ok(s) => Some(s),
                     Err(e) => {
-                        eprintln!("Error compiling: {e:?}");
+                        self.page = Err(e);
                         None
                     }
                 };
@@ -679,7 +700,7 @@ impl State {
                         }
                     };
                     let pixmap = typst_render::render(page, &opt);
-                    self.page = Some(image::Handle::from_rgba(
+                    self.page = Ok(image::Handle::from_rgba(
                         pixmap.width(),
                         pixmap.height(),
                         pixmap.data().to_vec(),
@@ -694,7 +715,7 @@ impl State {
                             Some(page) => {
                                 self.curr_page = p - 1;
                                 let pixmap = typst_render::render(page, &opt);
-                                self.page = Some(image::Handle::from_rgba(
+                                self.page = Ok(image::Handle::from_rgba(
                                     pixmap.width(),
                                     pixmap.height(),
                                     pixmap.data().to_vec(),
@@ -713,7 +734,7 @@ impl State {
                         Some(page) => {
                             self.curr_page += 1;
                             let pixmap = typst_render::render(page, &opt);
-                            self.page = Some(image::Handle::from_rgba(
+                            self.page = Ok(image::Handle::from_rgba(
                                 pixmap.width(),
                                 pixmap.height(),
                                 pixmap.data().to_vec(),
@@ -730,7 +751,7 @@ impl State {
                         Some(page) => {
                             self.curr_page -= 1;
                             let pixmap = typst_render::render(page, &opt);
-                            self.page = Some(image::Handle::from_rgba(
+                            self.page = Ok(image::Handle::from_rgba(
                                 pixmap.width(),
                                 pixmap.height(),
                                 pixmap.data().to_vec(),
@@ -1060,7 +1081,7 @@ impl State {
                             .width(Length::FillPortion(2))
                             .into(),
                         _ => mouse_area(
-                            container(text(k))
+                            container(ellipsized_text(k))
                                 .padding(5)
                                 .style(container::bordered_box)
                                 .width(Length::FillPortion(2)),
@@ -1076,7 +1097,7 @@ impl State {
                         ),
                         name,
                         tooltip(
-                            container(text(v.relative_time()))
+                            container(ellipsized_text(v.relative_time()))
                                 .padding(5)
                                 .style(container::bordered_box)
                                 .width(Length::FillPortion(1)),
@@ -1116,14 +1137,14 @@ impl State {
                 ]
                 .spacing(5),
                 row![
-                    text("Project Name:").width(Length::FillPortion(1)),
+                    ellipsized_text("Project Name:").width(Length::FillPortion(1)),
                     text_input("Name", &self.project.metadata.name)
                         .on_input(Message::ProjectNameChange)
                         .width(Length::FillPortion(3))
                 ]
                 .width(Length::Fill),
                 row![
-                    text("Description:").width(Length::FillPortion(1)),
+                    ellipsized_text("Description:").width(Length::FillPortion(1)),
                     if self.project.metadata.description.contains("\n") {
                         row![
                             tooltip(
@@ -1165,7 +1186,7 @@ impl State {
                     }
                 ],
                 row![
-                    text("Alternative:").width(Length::FillPortion(1)),
+                    ellipsized_text("Alternative:").width(Length::FillPortion(1)),
                     row![
                         pick_list(
                             self.project.alt_list.as_ref(),
@@ -1188,7 +1209,7 @@ impl State {
                     .width(Length::FillPortion(3)),
                 ]
                 .width(Length::Fill),
-                text("Variables"),
+                ellipsized_text("Variables"),
                 container(
                     scrollable(match &self.alternative {
                         Some(alt) => self.project.alternatives[alt].view(&self.editing),
@@ -1241,6 +1262,11 @@ impl State {
                         "Refresh Page",
                         Some(Message::RefreshPage)
                     ),
+                    icons::action(
+                        icons::cog_icon(),
+                        "Preview Settings",
+                        (!self.has_query()).then_some(Message::PreviewSettings)
+                    ),
                     horizontal().width(Length::Fill),
                     row![
                         icons::action(
@@ -1259,16 +1285,12 @@ impl State {
                     .height(25),
                     horizontal().width(Length::FillPortion(1)),
                     icons::action(
-                        icons::cog_icon(),
-                        "Preview Settings",
-                        (!self.has_query()).then_some(Message::PreviewSettings)
-                    ),
-                    icons::action(
                         icons::file_pdf_icon(),
                         "Export",
                         (!self.has_query()).then_some(Message::StartExport)
                     ),
-                ],
+                ]
+                .spacing(5),
                 self.page()
             ]
             .spacing(25)
@@ -1278,14 +1300,18 @@ impl State {
     }
 
     fn page<'a>(&'a self) -> Element<'a, Message> {
-        if let Some(p) = &self.page {
-            image::viewer(p.clone())
+        match &self.page {
+            Ok(p) => image::viewer(p.clone())
                 .content_fit(iced::ContentFit::Contain)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .into()
-        } else {
-            text("Compile to see preview").into()
+                .into(),
+            Err(e) => text(e)
+                .font(iced::font::Font::MONOSPACE)
+                .style(text::danger)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
         }
     }
 }
@@ -1520,14 +1546,14 @@ impl Alternative {
                                     .on_submit(Message::SubmitVariableEdit)
                                     .width(Length::FillPortion(1)),
                                 mouse_area(
-                                    container(text(&v.value))
+                                    container(ellipsized_text(&v.value))
                                         .padding(5)
                                         .style(container::bordered_box)
                                         .width(Length::FillPortion(3))
                                 )
                                 .on_press(Message::StartEdit(i, false)),
                                 tooltip(
-                                    container(text(v.relative_time()))
+                                    container(ellipsized_text(v.relative_time()))
                                         .padding(5)
                                         .style(container::bordered_box)
                                         .width(Length::FillPortion(1)),
@@ -1539,7 +1565,7 @@ impl Alternative {
                         } else {
                             row![
                                 mouse_area(
-                                    container(text(k))
+                                    container(ellipsized_text(k))
                                         .padding(5)
                                         .style(container::bordered_box)
                                         .width(Length::FillPortion(1))
@@ -1551,7 +1577,7 @@ impl Alternative {
                                     .on_submit(Message::SubmitVariableEdit)
                                     .width(Length::FillPortion(3)),
                                 tooltip(
-                                    container(text(v.relative_time()))
+                                    container(ellipsized_text(v.relative_time()))
                                         .padding(5)
                                         .style(container::bordered_box)
                                         .width(Length::FillPortion(1)),
@@ -1564,21 +1590,21 @@ impl Alternative {
                     } else {
                         row![
                             mouse_area(
-                                container(text(k))
+                                container(ellipsized_text(k))
                                     .padding(5)
                                     .style(container::bordered_box)
                                     .width(Length::FillPortion(1))
                             )
                             .on_press(Message::StartEdit(i, true)),
                             mouse_area(
-                                container(text(&v.value))
+                                container(ellipsized_text(&v.value))
                                     .padding(5)
                                     .style(container::bordered_box)
                                     .width(Length::FillPortion(3))
                             )
                             .on_press(Message::StartEdit(i, false)),
                             tooltip(
-                                container(text(v.relative_time()))
+                                container(ellipsized_text(v.relative_time()))
                                     .padding(5)
                                     .style(container::bordered_box)
                                     .width(Length::FillPortion(1)),
@@ -1598,21 +1624,21 @@ impl Alternative {
                 .map(|(i, (k, v))| {
                     row![
                         mouse_area(
-                            container(text(k))
+                            container(ellipsized_text(k))
                                 .padding(5)
                                 .style(container::bordered_box)
                                 .width(Length::FillPortion(1))
                         )
                         .on_press(Message::StartEdit(i, true)),
                         mouse_area(
-                            container(text(&v.value))
+                            container(ellipsized_text(&v.value))
                                 .padding(5)
                                 .style(container::bordered_box)
                                 .width(Length::FillPortion(3))
                         )
                         .on_press(Message::StartEdit(i, false)),
                         tooltip(
-                            container(text(v.relative_time()))
+                            container(ellipsized_text(v.relative_time()))
                                 .padding(5)
                                 .style(container::bordered_box)
                                 .width(Length::FillPortion(1)),
@@ -1630,7 +1656,7 @@ impl Alternative {
             vars.push(
                 row![
                     mouse_area(
-                        container(text("+ New").color(Color::WHITE.scale_alpha(0.4)))
+                        container(ellipsized_text("+ New").color(Color::WHITE.scale_alpha(0.4)))
                             .padding(5)
                             .style(container::bordered_box)
                             .width(Length::FillPortion(1))
