@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::{fs::File, path::Path};
 use typst::foundations::{Dict, Value};
 use typst::layout::{PageRange, PageRanges};
-use typst_as_lib::{TypstAsLibError, TypstEngine, TypstTemplateMainFile, TypstWorldBuilder};
+use typst_as_lib::{TypstEngine, TypstTemplateMainFile, typst_kit_options::TypstKitFontOptions};
 use typst_iced_editor::{Action, Content, code_editor};
 use typst_layout::PagedDocument;
 use zip::ZipWriter;
@@ -22,14 +22,13 @@ use zip::read::ZipArchive;
 use zip::write::FileOptions;
 mod error;
 mod icons;
+mod viewer;
 
 macro_rules! current_user {
     () => {
         whoami::realname().ok().or_else(|| whoami::username().ok())
     };
 }
-
-static FONT: &[u8] = include_bytes!("./DejaVuSans.ttf");
 
 fn main() {
     iced::application(State::new, State::update, State::view)
@@ -74,7 +73,7 @@ impl Default for State {
             editing: None,
             page: Err(error::TypstError::default()),
             curr_page: 0,
-            pix_pt: 1.0,
+            pix_pt: 2.2,
             query: None,
         }
     }
@@ -86,7 +85,7 @@ impl State {
         match args.as_slice() {
             [] => (
                 State {
-                    pix_pt: 1.0,
+                    pix_pt: 2.2,
                     ..Default::default()
                 },
                 Task::none(),
@@ -110,7 +109,7 @@ impl State {
                     State {
                         project,
                         engine,
-                        pix_pt: 1.0,
+                        pix_pt: 2.2,
                         ..Default::default()
                     },
                     Task::done(Message::RefreshPage),
@@ -126,14 +125,14 @@ impl State {
 
     fn non_template_query(&self) -> Option<&Query> {
         match &self.query {
-            None | Some(Query::EditTemplate(_)) => None,
+            None | Some(Query::EditTemplate(..)) => None,
             Some(q) => Some(q),
         }
     }
 
-    fn edit_template(&self) -> Option<&Content> {
+    fn edit_template(&self) -> Option<(&Content, &bool)> {
         match &self.query {
-            Some(Query::EditTemplate(c)) => Some(c),
+            Some(Query::EditTemplate(c, b)) => Some((c, b)),
             _ => None,
         }
     }
@@ -341,7 +340,7 @@ struct PreviewSettings {
 enum Query {
     NewAlternative(String, Option<String>),
     RenameAlternative(String, String),
-    EditTemplate(Content),
+    EditTemplate(Content, bool),
     EditDescription(Content),
     ExportFile(ExportOptions),
     PreviewSettings(PreviewSettings),
@@ -378,13 +377,23 @@ impl Query {
                 .width(Length::FillPortion(2))
                 .into(),
             ),
-            Query::EditTemplate(content) => (
+            Query::EditTemplate(content, update) => (
                 "Edit Typst Template",
-                code_editor(&content)
-                    .on_action(Message::QueryEditorAction)
-                    .height(Length::Fill)
-                    .width(Length::FillPortion(2))
-                    .into(),
+                column![
+                    row![
+                        horizontal(),
+                        checkbox(*update).on_toggle(Message::QueryCheckboxToggle),
+                        text("Instant Update"),
+                    ]
+                    .spacing(10)
+                    .width(Length::FillPortion(2)),
+                    code_editor(&content)
+                        .on_action(Message::QueryEditorAction)
+                        .height(Length::Fill)
+                        .width(Length::FillPortion(2))
+                ]
+                .spacing(10)
+                .into(),
             ),
             Query::EditDescription(content) => (
                 "Edit Description",
@@ -504,6 +513,10 @@ enum Message {
     DownloadResourceTo(usize, Option<PathBuf>),
     UploadResource,
     UploadFiles(Option<Vec<PathBuf>>),
+    CSVExportStart,
+    CSVImportStart,
+    CSVExport(Option<PathBuf>),
+    CSVImport(Option<PathBuf>),
     NextPage,
     PreviousPage,
     PageChange(String),
@@ -630,6 +643,18 @@ impl State {
                 self.project.save_file(&path).unwrap();
                 self.filepath = Some(path);
             }
+            Message::CSVExportStart => {
+                return Task::perform(save_file_dialog("variables.csv".into()), Message::CSVExport);
+            }
+            Message::CSVImportStart => {
+                return Task::perform(csv_import_dialog(), Message::CSVImport);
+            }
+            Message::CSVExport(Some(fname)) => {
+                self.project.export_csv(fname);
+            }
+            Message::CSVImport(Some(fname)) => {
+                self.project.import_csv(fname);
+            }
             Message::UploadResource => {
                 return Task::perform(upload_files_dialog(), Message::UploadFiles);
             }
@@ -670,7 +695,7 @@ impl State {
                     .map(|(k, v)| (k.as_str().into(), Value::Str(v.value.clone().into())))
                     .collect();
 
-                let output = if let Some(cont) = self.edit_template() {
+                let output = if let Some((cont, _)) = self.edit_template() {
                     let eng = self.project.typst_engine(cont.text());
                     error::compile_typst(&eng, vars)
                 } else {
@@ -745,7 +770,9 @@ impl State {
                 }
             }
             Message::PreviousPage => {
-                if let Some(d) = &self.document {
+                if self.curr_page > 0
+                    && let Some(d) = &self.document
+                {
                     let opt = typst_render::RenderOptions::default();
                     match d.pages().get(self.curr_page - 1) {
                         Some(page) => {
@@ -776,7 +803,7 @@ impl State {
                         self.project.rename_alternative(&old, name.clone());
                         self.alternative = Some(name)
                     }
-                    Query::EditTemplate(content) => {
+                    Query::EditTemplate(content, _) => {
                         self.project.template = content.text();
                         self.engine =
                             Some(self.project.typst_engine(self.project.template.clone()));
@@ -829,7 +856,14 @@ impl State {
                 return Task::done(Message::RefreshPage);
             }
             Message::CancelQuery => {
+                let update = self.edit_template().is_some();
                 self.query = None;
+                if update {
+                    // because we show the page based on the
+                    // upsubmitted template content, we want to
+                    // refresh it
+                    return Task::done(Message::RefreshPage);
+                }
             }
             Message::QueryStringEdit(val) => {
                 match self.query.take() {
@@ -887,6 +921,9 @@ impl State {
                         opt.export_all = val;
                         self.query = Some(Query::ExportFile(opt));
                     }
+                    Some(Query::EditTemplate(cont, _)) => {
+                        self.query = Some(Query::EditTemplate(cont, val));
+                    }
                     q => {
                         self.query = q;
                     }
@@ -894,8 +931,12 @@ impl State {
             }
             Message::QueryEditorAction(act) => {
                 match &mut self.query {
-                    Some(Query::EditTemplate(content)) => {
+                    Some(Query::EditTemplate(content, update)) => {
+                        let update = *update && act.is_edit();
                         content.perform(act);
+                        if update {
+                            return Task::done(Message::RefreshPage);
+                        }
                     }
                     Some(Query::EditDescription(content)) => {
                         content.perform(act);
@@ -943,9 +984,10 @@ impl State {
                 )));
             }
             Message::EditTemplate => {
-                self.query = Some(Query::EditTemplate(Content::with_text(
-                    &self.project.template,
-                )));
+                self.query = Some(Query::EditTemplate(
+                    Content::with_text(&self.project.template),
+                    true,
+                ));
             }
             Message::AlternativeSelect(alt) => {
                 self.alternative = Some(alt);
@@ -1044,11 +1086,14 @@ impl State {
     }
 
     fn left_pane<'a>(&'a self) -> Element<'a, Message> {
-        if let Some(content) = self.edit_template() {
+        if let Some((content, update)) = self.edit_template() {
             column![
                 text("Edit Typst Template"),
                 row![
                     button("Submit").on_press(Message::SubmitQuery),
+                    horizontal(),
+                    checkbox(*update).on_toggle(Message::QueryCheckboxToggle),
+                    text("Instant Update"),
                     horizontal(),
                     button("Cancel").on_press(Message::CancelQuery)
                 ]
@@ -1209,7 +1254,21 @@ impl State {
                     .width(Length::FillPortion(3)),
                 ]
                 .width(Length::Fill),
-                ellipsized_text("Variables"),
+                row![
+                    ellipsized_text("Variables"),
+                    icons::action(
+                        icons::double_up_icon(),
+                        "Export Alternatives as CSV",
+                        self.query.is_none().then(|| Message::CSVExportStart)
+                    ),
+                    horizontal().width(Length::Fill),
+                    icons::action(
+                        icons::double_down_icon(),
+                        "Load Alternatives from CSV",
+                        self.query.is_none().then(|| Message::CSVImportStart)
+                    )
+                ]
+                .spacing(5),
                 container(
                     scrollable(match &self.alternative {
                         Some(alt) => self.project.alternatives[alt].view(&self.editing),
@@ -1301,7 +1360,7 @@ impl State {
 
     fn page<'a>(&'a self) -> Element<'a, Message> {
         match &self.page {
-            Ok(p) => image::viewer(p.clone())
+            Ok(p) => viewer::Viewer::new(p.clone())
                 .content_fit(iced::ContentFit::Contain)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1377,6 +1436,7 @@ impl Project {
         self.resources.insert(
             fname,
             Resource {
+                ty: None,
                 path: filename,
                 contents: data,
                 last_modified: Utc::now(),
@@ -1449,14 +1509,88 @@ impl Project {
         TypstEngine::builder()
             .with_static_file_resolver(res)
             .main_file(text)
-            // might as well let users upload fonts; keep one as backup
-            .fonts([FONT])
+            .search_fonts_with(
+                TypstKitFontOptions::default()
+                    .include_system_fonts(false)
+                    // This line is not necessary, because thats the default.
+                    .include_embedded_fonts(true),
+            )
+            // might as well let users upload fonts; in case someone wants to be fancy
+            .fonts(
+                self.resources
+                    .values()
+                    .filter(|r| matches!(r.ty, Some(ResourceType::Font)))
+                    .map(|r| r.contents.as_slice()),
+            )
             .build()
     }
+
+    // export alternatives as CSV with values
+    fn export_csv(&self, filename: PathBuf) {
+        let mut w = csv::Writer::from_path(filename).unwrap();
+        let mut fields: Vec<String> = self.variables.variables.keys().cloned().collect();
+        fields.insert(0, "".into());
+        _ = w.write_record(&fields);
+        fn write_vals(w: &mut csv::Writer<File>, vals: &IndexMap<String, Variable>, name: &str) {
+            let mut fields: Vec<String> = vals.values().map(|v| v.value.clone()).collect();
+            fields.insert(0, name.to_string());
+            _ = w.write_record(fields);
+        }
+
+        write_vals(&mut w, &self.variables.variables, "");
+        for (name, alt) in &self.alternatives {
+            write_vals(&mut w, &alt.variables, name);
+        }
+    }
+
+    // import alternatives from CSV with each row as alternative
+    // We need to have an import Query that takes the column with name for alternative, can have template, we use the same system, but have each column available as variables
+    fn import_csv(&mut self, filename: PathBuf) {
+        let mut rdr = csv::Reader::from_path(filename).unwrap();
+        if let Ok(headers) = rdr.headers() {
+            let fields: Vec<String> = headers.deserialize(None).unwrap();
+            self.alternatives.clear();
+            self.alt_list.clear();
+            for result in rdr.records() {
+                let record = result.unwrap();
+                let row: Vec<String> = record.deserialize(None).unwrap();
+                eprintln!("{row:?}");
+                let name = row[0].trim().to_string();
+                let variables: IndexMap<String, Variable> = fields
+                    .iter()
+                    .zip(row.into_iter())
+                    .skip(if fields[0].is_empty() { 1 } else { 0 })
+                    .map(|(k, v)| (k.to_string(), Variable::new(k.to_string(), v)))
+                    .collect();
+                let alt = Alternative {
+                    name: name.clone(),
+                    variables,
+                };
+                if name.is_empty() || name == "Default" {
+                    self.variables = alt;
+                } else {
+                    self.alternatives.insert(name.clone(), alt);
+                    self.alt_list.push(name);
+                }
+            }
+        }
+    }
+}
+
+// use this to put icons, let user edit source and Text files through
+// query, add more fonts to typst document, maybe show image previews,
+// we can auto detect them but also give a dropdown for user; open using external app by saving to temp dir is also possible...
+#[derive(Clone, Serialize, Deserialize)]
+enum ResourceType {
+    Image,
+    Source,
+    Text,
+    Font,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct Resource {
+    ty: Option<ResourceType>,
     path: PathBuf,
     #[serde(skip)]
     contents: Vec<u8>,
@@ -1740,6 +1874,13 @@ impl Default for Variable {
 }
 
 impl Variable {
+    fn new(name: String, value: String) -> Self {
+        Self {
+            name,
+            value,
+            ..Default::default()
+        }
+    }
     fn relative_time(&self) -> String {
         let duration = Utc::now().signed_duration_since(&self.last_modified);
         if duration.num_seconds() < 60 {
@@ -1793,6 +1934,15 @@ async fn save_file_dialog(filename: String) -> Option<PathBuf> {
     fd.add_filter("All Files (*.*)", &["*"])
         .set_file_name(filename)
         .save_file()
+        .await
+        .map(|p| p.into())
+}
+
+async fn csv_import_dialog() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_title("Import CSV")
+        .add_filter("CSV File (*.csv)", &["csv"])
+        .pick_file()
         .await
         .map(|p| p.into())
 }

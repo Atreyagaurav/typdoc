@@ -1,9 +1,9 @@
 use iced::widget::text::Span;
 use typst::diag::{SourceDiagnostic, Warned};
-use typst::foundations::{Dict, Value};
+use typst::foundations::Dict;
 use typst::syntax::FileId;
 use typst::utils::LazyHash;
-use typst_as_lib::{TypstAsLibError, TypstEngine, TypstTemplateMainFile, TypstWorld};
+use typst_as_lib::{TypstEngine, TypstTemplateMainFile, TypstWorld};
 use typst_kit::diagnostics::{DiagnosticWorld, emit};
 use typst_layout::PagedDocument;
 
@@ -25,7 +25,8 @@ pub fn compile_typst(
         output,
         warnings: _,
     } = typst::compile(&world);
-    comemo::evict(30);
+    // I think we wanna keep cache for incremental compilation
+    // comemo::evict(30);
     output.map_err(|e| format_source_error(&e, &DiWrd(world)))
 }
 
