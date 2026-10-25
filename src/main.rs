@@ -3,7 +3,7 @@ use core::num::NonZero;
 use iced::Element;
 use iced::widget::{
     button, checkbox, column, container, image, mouse_area, operation::focus, pick_list, row,
-    scrollable, space::horizontal, text, text::Rich, text_input, tooltip,
+    scrollable, space::horizontal, text, text::Rich, text_editor, text_input, tooltip,
 };
 use iced::{Color, Length, Task};
 use iced_palace::widget::{ellipsized_text, labeled_slider};
@@ -341,7 +341,8 @@ enum Query {
     NewAlternative(String, Option<String>),
     RenameAlternative(String, String),
     EditTemplate(Content, bool),
-    EditDescription(Content),
+    EditDescription(text_editor::Content),
+    EditResource(String, text_editor::Content),
     ExportFile(ExportOptions),
     PreviewSettings(PreviewSettings),
 }
@@ -377,30 +378,28 @@ impl Query {
                 .width(Length::FillPortion(2))
                 .into(),
             ),
-            Query::EditTemplate(content, update) => (
-                "Edit Typst Template",
+            // Edit template goes to left pane, so this is never used
+            Query::EditTemplate(_, _) => {
+                panic!("This should not be used when editing template")
+            }
+            Query::EditResource(filename, content) => (
+                "Edit Resource",
                 column![
-                    row![
-                        horizontal(),
-                        checkbox(*update).on_toggle(Message::QueryCheckboxToggle),
-                        text("Instant Update"),
-                    ]
-                    .spacing(10)
-                    .width(Length::FillPortion(2)),
-                    code_editor(&content)
-                        .on_action(Message::QueryEditorAction)
+                    row![text("Editing: "), text(filename), horizontal()]
+                        .spacing(10)
+                        .width(Length::FillPortion(2)),
+                    text_editor(content)
+                        .on_action(Message::TextEditorAction)
                         .height(Length::Fill)
-                        .width(Length::FillPortion(2))
                 ]
                 .spacing(10)
                 .into(),
             ),
             Query::EditDescription(content) => (
                 "Edit Description",
-                code_editor(&content)
-                    .on_action(Message::QueryEditorAction)
+                text_editor(&content)
+                    .on_action(Message::TextEditorAction)
                     .height(Length::Fill)
-                    .width(Length::FillPortion(2))
                     .into(),
             ),
             Query::ExportFile(opt) => (
@@ -488,10 +487,12 @@ enum Message {
     CancelQuery,
     EditTemplate,
     PreviewSettings,
-    QueryEditorAction(Action),
+    TemplateEditorAction(Action),
+    TextEditorAction(text_editor::Action),
     QueryStringEdit(String),
     QueryString2Edit(String),
     QueryDropDownChanged(String),
+    ResourceTypeChanged(usize, ResourceType),
     QueryCheckboxToggle(bool),
     QueryPixPtChange(f64),
     ExportFormatChanged(ExportFormat),
@@ -507,6 +508,7 @@ enum Message {
     SubmitVariableEdit,
     NewVariable,
     StartExport,
+    EditResource(usize),
     RenameResource(usize),
     DeleteResource(usize),
     DownloadResource(usize),
@@ -811,6 +813,10 @@ impl State {
                     Query::EditDescription(content) => {
                         self.project.metadata.description = content.text();
                     }
+                    Query::EditResource(filename, content) => {
+                        self.project.resources[&filename]
+                            .update(content.text().as_bytes().to_vec());
+                    }
                     Query::ExportFile(opt) => {
                         let pages = parse_pages(opt.pages.trim());
                         if opt.export_all {
@@ -929,7 +935,7 @@ impl State {
                     }
                 };
             }
-            Message::QueryEditorAction(act) => {
+            Message::TemplateEditorAction(act) => {
                 match &mut self.query {
                     Some(Query::EditTemplate(content, update)) => {
                         let update = *update && act.is_edit();
@@ -938,7 +944,15 @@ impl State {
                             return Task::done(Message::RefreshPage);
                         }
                     }
+                    _ => (),
+                };
+            }
+            Message::TextEditorAction(act) => {
+                match &mut self.query {
                     Some(Query::EditDescription(content)) => {
+                        content.perform(act);
+                    }
+                    Some(Query::EditResource(_, content)) => {
                         content.perform(act);
                     }
                     _ => (),
@@ -979,7 +993,7 @@ impl State {
                 self.query = Some(Query::ExportFile(opt));
             }
             Message::MultiLineDescription => {
-                self.query = Some(Query::EditDescription(Content::with_text(
+                self.query = Some(Query::EditDescription(text_editor::Content::with_text(
                     &self.project.metadata.description,
                 )));
             }
@@ -989,9 +1003,26 @@ impl State {
                     true,
                 ));
             }
+            Message::EditResource(ind) => {
+                if let Some((name, res)) = self.project.resources.get_index(ind) {
+                    if let Ok(cont) = str::from_utf8(&res.contents) {
+                        self.query = Some(Query::EditResource(
+                            name.to_string(),
+                            text_editor::Content::with_text(cont),
+                        ));
+                    } else {
+                        // invalid string, we need to add error display system
+                    }
+                }
+            }
             Message::AlternativeSelect(alt) => {
                 self.alternative = Some(alt);
                 return Task::done(Message::RefreshPage);
+            }
+            Message::ResourceTypeChanged(ind, rt) => {
+                if let Some((_, res)) = self.project.resources.get_index_mut(ind) {
+                    res.ty = Some(rt);
+                }
             }
             Message::EditVariableField(fd) => {
                 if let Some(var) = &mut self.editing {
@@ -1099,7 +1130,7 @@ impl State {
                 ]
                 .spacing(25),
                 code_editor(&content)
-                    .on_action(Message::QueryEditorAction)
+                    .on_action(Message::TemplateEditorAction)
                     .height(Length::Fill)
                     .width(Length::FillPortion(4)),
             ]
@@ -1140,6 +1171,15 @@ impl State {
                             "Download",
                             Some(Message::DownloadResource(i))
                         ),
+                        icons::action(
+                            icons::pencil_icon(),
+                            "Edit",
+                            v.valid_text.then(|| Message::EditResource(i))
+                        ),
+                        pick_list(ResourceType::all(), v.ty.clone(), move |t| {
+                            Message::ResourceTypeChanged(i, t)
+                        })
+                        .placeholder("Type"),
                         name,
                         tooltip(
                             container(ellipsized_text(v.relative_time()))
@@ -1433,16 +1473,7 @@ impl Project {
         let mut file = std::fs::File::open(&filename).unwrap();
         let mut data: Vec<u8> = Vec::new();
         file.read_to_end(&mut data).unwrap();
-        self.resources.insert(
-            fname,
-            Resource {
-                ty: None,
-                path: filename,
-                contents: data,
-                last_modified: Utc::now(),
-                uploaded_by: current_user!(),
-            },
-        );
+        self.resources.insert(fname, Resource::new(filename, data));
     }
 
     fn save_file(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -1554,7 +1585,6 @@ impl Project {
             for result in rdr.records() {
                 let record = result.unwrap();
                 let row: Vec<String> = record.deserialize(None).unwrap();
-                eprintln!("{row:?}");
                 let name = row[0].trim().to_string();
                 let variables: IndexMap<String, Variable> = fields
                     .iter()
@@ -1580,12 +1610,31 @@ impl Project {
 // use this to put icons, let user edit source and Text files through
 // query, add more fonts to typst document, maybe show image previews,
 // we can auto detect them but also give a dropdown for user; open using external app by saving to temp dir is also possible...
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 enum ResourceType {
     Image,
-    Source,
     Text,
     Font,
+}
+
+impl std::fmt::Display for ResourceType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Image => "Image",
+                Self::Text => "Text",
+                Self::Font => "Font",
+            }
+        )
+    }
+}
+
+impl ResourceType {
+    fn all() -> &'static [Self] {
+        &[Self::Image, Self::Text, Self::Font]
+    }
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -1596,9 +1645,30 @@ struct Resource {
     contents: Vec<u8>,
     last_modified: DateTime<Utc>,
     uploaded_by: Option<String>,
+    #[serde(default)]
+    valid_text: bool,
 }
 
 impl Resource {
+    fn new(filename: PathBuf, contents: Vec<u8>) -> Self {
+        let valid_text = str::from_utf8(&contents).is_ok();
+        Resource {
+            ty: None,
+            path: filename,
+            contents: contents,
+            last_modified: Utc::now(),
+            uploaded_by: current_user!(),
+            valid_text,
+        }
+    }
+
+    fn update(&mut self, contents: Vec<u8>) {
+        self.valid_text = str::from_utf8(&contents).is_ok();
+        self.contents = contents;
+        self.last_modified = Utc::now();
+        self.uploaded_by = current_user!();
+    }
+
     fn relative_time(&self) -> String {
         let duration = Utc::now().signed_duration_since(&self.last_modified);
         if duration.num_seconds() < 60 {

@@ -31,9 +31,9 @@ impl<Handle> Viewer<Handle> {
             padding: 0.0,
             width: Length::Shrink,
             height: Length::Shrink,
-            min_scale: 0.25,
+            min_scale: 0.2,
             max_scale: 10.0,
-            scale_step: 0.10,
+            scale_step: 0.02,
             filter_method: FilterMethod::default(),
             content_fit: ContentFit::default(),
         }
