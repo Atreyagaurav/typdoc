@@ -1200,7 +1200,8 @@ impl State {
                         icons::action(
                             icons::pencil_icon(),
                             "Edit",
-                            v.valid_text.then(|| Message::EditResource(i))
+                            (v.valid_text && self.query.is_none())
+                                .then(|| Message::EditResource(i))
                         ),
                         pick_list(ResourceType::all(), v.ty.clone(), move |t| {
                             Message::ResourceTypeChanged(i, t)
@@ -1278,7 +1279,7 @@ impl State {
                             icons::action(
                                 icons::pencil_icon(),
                                 "Edit Description",
-                                Some(Message::MultiLineDescription)
+                                self.query.is_none().then(|| Message::MultiLineDescription)
                             ),
                         ]
                         .width(Length::FillPortion(3))
@@ -1290,7 +1291,7 @@ impl State {
                             icons::action(
                                 icons::pencil_icon(),
                                 "Edit Description",
-                                Some(Message::MultiLineDescription)
+                                self.query.is_none().then(|| Message::MultiLineDescription)
                             ),
                         ]
                         .width(Length::FillPortion(3))
@@ -1309,8 +1310,7 @@ impl State {
                         icons::action(
                             icons::pencil_icon(),
                             "Edit Alternative",
-                            self.alternative
-                                .is_some()
+                            (self.alternative.is_some() && self.query.is_none())
                                 .then(|| Message::RenameAlternative)
                         ),
                         icons::action(
