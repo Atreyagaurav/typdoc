@@ -7,6 +7,7 @@ use iced::widget::{
 };
 use iced::{Color, Length, Task};
 use iced_palace::widget::{ellipsized_text, labeled_slider};
+use iced_split::vertical_split;
 use indexmap::{IndexMap, map::MutableEntryKey};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -56,9 +57,10 @@ struct State {
     document: Option<PagedDocument>,
     alternative: Option<String>,
     editing: Option<CurrentlyEditing>,
-    page: Result<image::Handle, error::TypstError>,
+    page: Result<image::Allocation, error::TypstError>,
     curr_page: usize,
     pix_pt: f64,
+    split_at: f32,
     query: Option<Query>,
 }
 
@@ -74,6 +76,7 @@ impl Default for State {
             page: Err(error::TypstError::default()),
             curr_page: 0,
             pix_pt: 2.2,
+            split_at: 0.5,
             query: None,
         }
     }
@@ -499,7 +502,7 @@ enum Message {
     ProjectNameChange(String),
     ProjectDescriptionChange(String),
     MultiLineDescription,
-    ShowBaseCase,
+    ShowDefault,
     NewAlternative,
     RenameAlternative,
     AlternativeSelect(String),
@@ -522,6 +525,8 @@ enum Message {
     NextPage,
     PreviousPage,
     PageChange(String),
+    SplitMoved(f32),
+    Allocated(Result<image::Allocation, image::Error>),
 }
 
 struct TypDoc;
@@ -629,6 +634,9 @@ impl State {
                 return Task::done(Message::RefreshPage);
             }
             Message::SaveProject => {
+                if let Some((cont, _)) = self.edit_template() {
+                    self.project.template = cont.text();
+                }
                 if let Some(path) = &self.filepath {
                     self.project.save_file(path).unwrap();
                 } else {
@@ -727,11 +735,12 @@ impl State {
                         }
                     };
                     let pixmap = typst_render::render(page, &opt);
-                    self.page = Ok(image::Handle::from_rgba(
+                    return image::allocate(image::Handle::from_rgba(
                         pixmap.width(),
                         pixmap.height(),
                         pixmap.data().to_vec(),
-                    ));
+                    ))
+                    .map(Message::Allocated);
                 }
             }
             Message::PageChange(new) => {
@@ -742,11 +751,12 @@ impl State {
                             Some(page) => {
                                 self.curr_page = p - 1;
                                 let pixmap = typst_render::render(page, &opt);
-                                self.page = Ok(image::Handle::from_rgba(
+                                return image::allocate(image::Handle::from_rgba(
                                     pixmap.width(),
                                     pixmap.height(),
                                     pixmap.data().to_vec(),
-                                ));
+                                ))
+                                .map(Message::Allocated);
                             }
                             None => (),
                         }
@@ -761,11 +771,12 @@ impl State {
                         Some(page) => {
                             self.curr_page += 1;
                             let pixmap = typst_render::render(page, &opt);
-                            self.page = Ok(image::Handle::from_rgba(
+                            return image::allocate(image::Handle::from_rgba(
                                 pixmap.width(),
                                 pixmap.height(),
                                 pixmap.data().to_vec(),
-                            ));
+                            ))
+                            .map(Message::Allocated);
                         }
                         None => return Task::none(),
                     }
@@ -780,11 +791,12 @@ impl State {
                         Some(page) => {
                             self.curr_page -= 1;
                             let pixmap = typst_render::render(page, &opt);
-                            self.page = Ok(image::Handle::from_rgba(
+                            return image::allocate(image::Handle::from_rgba(
                                 pixmap.width(),
                                 pixmap.height(),
                                 pixmap.data().to_vec(),
-                            ));
+                            ))
+                            .map(Message::Allocated);
                         }
                         None => return Task::none(),
                     }
@@ -869,6 +881,11 @@ impl State {
                     // upsubmitted template content, we want to
                     // refresh it
                     return Task::done(Message::RefreshPage);
+                }
+            }
+            Message::QueryDropDownChanged(v) => {
+                if let Some(Query::NewAlternative(_, from)) = &mut self.query {
+                    *from = Some(v);
                 }
             }
             Message::QueryStringEdit(val) => {
@@ -964,12 +981,15 @@ impl State {
             Message::ProjectDescriptionChange(desc) => {
                 self.project.metadata.description = desc;
             }
-            Message::ShowBaseCase => {
+            Message::ShowDefault => {
                 self.alternative = None;
                 return Task::done(Message::RefreshPage);
             }
             Message::NewAlternative => {
-                self.query = Some(Query::NewAlternative(String::new(), None));
+                self.query = Some(Query::NewAlternative(
+                    String::new(),
+                    self.alternative.clone(),
+                ));
             }
             Message::RenameAlternative => {
                 if let Some(alt) = &self.alternative {
@@ -1016,8 +1036,10 @@ impl State {
                 }
             }
             Message::AlternativeSelect(alt) => {
-                self.alternative = Some(alt);
-                return Task::done(Message::RefreshPage);
+                if self.finish_editing() {
+                    self.alternative = Some(alt);
+                    return Task::done(Message::RefreshPage);
+                }
             }
             Message::ResourceTypeChanged(ind, rt) => {
                 if let Some((_, res)) = self.project.resources.get_index_mut(ind) {
@@ -1037,25 +1059,18 @@ impl State {
             Message::NewVariable => {
                 self.finish_editing();
                 if self.editing.is_none() {
-                    if let Some(alt) = &self.alternative {
-                        self.editing = Some(CurrentlyEditing {
-                            variable: EditableVariable::VariableName,
-                            index: self.project.alternatives[alt].variables.len(),
-                            value: String::new(),
-                        });
-                        self.project.alternatives[alt]
-                            .variables
-                            .insert(String::new(), Variable::default());
-                    } else {
-                        self.editing = Some(CurrentlyEditing {
-                            variable: EditableVariable::VariableName,
-                            index: self.project.variables.variables.len(),
-                            value: String::new(),
-                        });
-                        self.project
-                            .variables
-                            .variables
-                            .insert(String::new(), Variable::default());
+                    self.editing = Some(CurrentlyEditing {
+                        variable: EditableVariable::VariableName,
+                        index: self.project.variables.variables.len(),
+                        value: String::new(),
+                    });
+                    self.project
+                        .variables
+                        .variables
+                        .insert(String::new(), Variable::default());
+
+                    for alt in self.project.alternatives.values_mut() {
+                        alt.variables.insert(String::new(), Variable::default());
                     }
                     return focus("currentEdit");
                 }
@@ -1103,17 +1118,23 @@ impl State {
                     }
                 }
             }
+            Message::SplitMoved(f) => {
+                self.split_at = f;
+            }
+            Message::Allocated(Ok(img)) => self.page = Ok(img),
             _ => (),
         }
         Task::none()
     }
 
     fn view<'a>(&'a self) -> Element<'a, Message> {
-        row![self.left_pane(), self.right_pane()]
-            .spacing(20)
-            .padding(20)
-            .width(Length::Fill)
-            .into()
+        vertical_split(
+            self.left_pane(),
+            self.right_pane(),
+            self.split_at,
+            Message::SplitMoved,
+        )
+        .into()
     }
 
     fn left_pane<'a>(&'a self) -> Element<'a, Message> {
@@ -1122,13 +1143,18 @@ impl State {
                 text("Edit Typst Template"),
                 row![
                     button("Submit").on_press(Message::SubmitQuery),
+                    icons::action(
+                        icons::download_icon(),
+                        "Save Project",
+                        Some(Message::SaveProject)
+                    ),
                     horizontal(),
                     checkbox(*update).on_toggle(Message::QueryCheckboxToggle),
                     text("Instant Update"),
                     horizontal(),
                     button("Cancel").on_press(Message::CancelQuery)
                 ]
-                .spacing(25),
+                .spacing(5),
                 code_editor(&content)
                     .on_action(Message::TemplateEditorAction)
                     .height(Length::Fill)
@@ -1283,7 +1309,9 @@ impl State {
                         icons::action(
                             icons::pencil_icon(),
                             "Edit Alternative",
-                            Some(Message::RenameAlternative)
+                            self.alternative
+                                .is_some()
+                                .then(|| Message::RenameAlternative)
                         ),
                         icons::action(
                             icons::add_new_icon(),
@@ -1311,8 +1339,8 @@ impl State {
                 .spacing(5),
                 container(
                     scrollable(match &self.alternative {
-                        Some(alt) => self.project.alternatives[alt].view(&self.editing),
-                        None => self.project.variables.view(&self.editing),
+                        Some(alt) => self.project.alternatives[alt].view(&self.editing, false),
+                        None => self.project.variables.view(&self.editing, true),
                     })
                     .height(Length::FillPortion(1))
                 )
@@ -1338,12 +1366,13 @@ impl State {
                 .style(container::bordered_box)
                 .padding(5),
                 row![
-                    button("Show Defaults").on_press(Message::ShowBaseCase),
+                    button("Show Defaults").on_press(Message::ShowDefault),
                     horizontal().width(Length::Fill),
                     button("Edit Template")
                         .on_press_maybe(self.query.is_none().then(|| Message::EditTemplate)),
                 ]
             ]
+            .padding(10)
             .spacing(10)
             .width(Length::FillPortion(2))
             .into()
@@ -1392,6 +1421,7 @@ impl State {
                 .spacing(5),
                 self.page()
             ]
+            .padding(10)
             .spacing(25)
             .width(Length::FillPortion(2))
             .into()
@@ -1400,7 +1430,7 @@ impl State {
 
     fn page<'a>(&'a self) -> Element<'a, Message> {
         match &self.page {
-            Ok(p) => viewer::Viewer::new(p.clone())
+            Ok(p) => viewer::Viewer::new(p.handle())
                 .content_fit(iced::ContentFit::Contain)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1725,7 +1755,7 @@ impl Default for Alternative {
 }
 
 impl Alternative {
-    fn view<'a>(&'a self, edit: &Option<CurrentlyEditing>) -> Element<'a, Message> {
+    fn view<'a>(&'a self, edit: &Option<CurrentlyEditing>, default: bool) -> Element<'a, Message> {
         let edits = edit
             .as_ref()
             .map(|e| match &e.variable {
@@ -1766,14 +1796,21 @@ impl Alternative {
                             ]
                             .spacing(10)
                         } else {
+                            let var = container(ellipsized_text(k).style(if default {
+                                text::primary
+                            } else {
+                                text::secondary
+                            }))
+                            .padding(5)
+                            .style(container::bordered_box)
+                            .width(Length::FillPortion(1));
+                            let var: Element<_> = if default {
+                                mouse_area(var).on_press(Message::StartEdit(i, true)).into()
+                            } else {
+                                var.into()
+                            };
                             row![
-                                mouse_area(
-                                    container(ellipsized_text(k))
-                                        .padding(5)
-                                        .style(container::bordered_box)
-                                        .width(Length::FillPortion(1))
-                                )
-                                .on_press(Message::StartEdit(i, true)),
+                                var,
                                 text_input("Value", val)
                                     .id("currentEdit")
                                     .on_input(Message::EditVariableField)
@@ -1791,14 +1828,21 @@ impl Alternative {
                             .spacing(10)
                         }
                     } else {
+                        let var = container(ellipsized_text(k).style(if default {
+                            text::primary
+                        } else {
+                            text::secondary
+                        }))
+                        .padding(5)
+                        .style(container::bordered_box)
+                        .width(Length::FillPortion(1));
+                        let var: Element<_> = if default {
+                            mouse_area(var).on_press(Message::StartEdit(i, true)).into()
+                        } else {
+                            var.into()
+                        };
                         row![
-                            mouse_area(
-                                container(ellipsized_text(k))
-                                    .padding(5)
-                                    .style(container::bordered_box)
-                                    .width(Length::FillPortion(1))
-                            )
-                            .on_press(Message::StartEdit(i, true)),
+                            var,
                             mouse_area(
                                 container(ellipsized_text(&v.value))
                                     .padding(5)
@@ -1825,14 +1869,21 @@ impl Alternative {
                 .iter()
                 .enumerate()
                 .map(|(i, (k, v))| {
+                    let var = container(ellipsized_text(k).style(if default {
+                        text::primary
+                    } else {
+                        text::secondary
+                    }))
+                    .padding(5)
+                    .style(container::bordered_box)
+                    .width(Length::FillPortion(1));
+                    let var: Element<_> = if default {
+                        mouse_area(var).on_press(Message::StartEdit(i, true)).into()
+                    } else {
+                        var.into()
+                    };
                     row![
-                        mouse_area(
-                            container(ellipsized_text(k))
-                                .padding(5)
-                                .style(container::bordered_box)
-                                .width(Length::FillPortion(1))
-                        )
-                        .on_press(Message::StartEdit(i, true)),
+                        var,
                         mouse_area(
                             container(ellipsized_text(&v.value))
                                 .padding(5)
@@ -1854,7 +1905,7 @@ impl Alternative {
                 })
                 .collect()
         };
-        if !self.variables.contains_key("") {
+        if !self.variables.contains_key("") && default {
             // If there is empty variable, then we can't add more empty ones
             vars.push(
                 row![
