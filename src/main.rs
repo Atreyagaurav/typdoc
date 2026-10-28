@@ -1583,6 +1583,7 @@ impl Project {
                     .filter(|r| matches!(r.ty, Some(ResourceType::Font)))
                     .map(|r| r.contents.as_slice()),
             )
+            .with_package_file_resolver()
             .build()
     }
 
